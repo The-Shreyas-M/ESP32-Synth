@@ -98,10 +98,12 @@ This technique converts the harsh, noticeable digital clicking into a much softe
 
 Implementation:
 
-![Project Screenshot](assets/1.jpg)
-![Project Screenshot](assets/2.jpg)
-![Project Screenshot](assets/3.jpg)
-![Project Screenshot](assets/4.jpg)
-![Project Screenshot](assets/5.jpg)
-![Project Screenshot](assets/6.jpg)
-![Project Screenshot](assets/7.jpg)
+<div align="center">
+  <img src="assets/1.jpg" width="300" alt="Project Screenshot 1"><br>
+  <img src="assets/2.jpg" width="300" alt="Project Screenshot 2"><br>
+  <img src="assets/3.jpg" width="300" alt="Project Screenshot 3"><br>
+  <img src="assets/4.jpg" width="300" alt="Project Screenshot 4"><br>
+  <img src="assets/5.jpg" width="300" alt="Project Screenshot 5"><br>
+  <img src="assets/6.jpg" width="300" alt="Project Screenshot 6"><br>
+  <img src="assets/7.jpg" width="300" alt="Project Screenshot 7"><br>
+</div>
