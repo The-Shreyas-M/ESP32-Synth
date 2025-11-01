@@ -94,3 +94,14 @@ The implemented solution is a form of **dithering**:
 2.  A small pseudo-random noise value is added to the sample **before** the final 8-bit quantization.
 
 This technique converts the harsh, noticeable digital clicking into a much softer, continuous background **hiss** or **white noise**, which is far less disruptive to the musical sound.
+
+
+Implementation:
+
+![Project Screenshot](assets/1.jpg)
+![Project Screenshot](assets/2.jpg)
+![Project Screenshot](assets/3.jpg)
+![Project Screenshot](assets/4.jpg)
+![Project Screenshot](assets/5.jpg)
+![Project Screenshot](assets/6.jpg)
+![Project Screenshot](assets/7.jpg)
