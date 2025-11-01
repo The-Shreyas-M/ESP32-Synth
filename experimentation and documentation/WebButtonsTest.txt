@@ -1,0 +1,81 @@
+#include <WiFi.h>
+#include <WebServer.h>
+
+// WiFi hotspot
+const char* ssid = "ESP-Hotspot";
+const char* password = "12345678";
+
+// Web server on port 80
+WebServer server(80);
+
+// Button pins + labels
+struct Button {
+  int pin;
+  const char* label;
+};
+
+Button buttons[] = {
+  {15, "F#"},
+  {33, "C"},
+  {4,  "D"},
+  {5,  "E"},
+  {18, "F"},
+  {19, "G"},
+  {21, "A"},
+  {22, "B"},
+  {23, "C"},
+  {13, "X1"},
+  {12, "X2"},
+  {14, "X3"},
+  {27, "X4"}
+};
+
+const int numButtons = sizeof(buttons) / sizeof(buttons[0]);
+
+// Webpage handler
+void handleRoot() {
+  String message = "";
+
+  // Collect pressed buttons
+  for (int i = 0; i < numButtons; i++) {
+    if (digitalRead(buttons[i].pin) == LOW) { // pressed
+      if (message.length() > 0) message += ", ";
+      message += "D" + String(buttons[i].pin) + ":" + buttons[i].label;
+    }
+  }
+
+  if (message.length() == 0) {
+    message = "Press a button";
+  }
+
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<meta http-equiv='refresh' content='1'>"; // refresh every 1 sec
+  html += "<title>ESP32 Button Test</title></head><body>";
+  html += "<h2>" + message + "</h2>";
+  html += "</body></html>";
+
+  server.send(200, "text/html", html);
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // Set button pins
+  for (int i = 0; i < numButtons; i++) {
+    pinMode(buttons[i].pin, INPUT_PULLUP);
+  }
+
+  // Start WiFi AP
+  WiFi.softAP(ssid, password);
+  Serial.println("Hotspot started: " + String(ssid));
+  Serial.print("IP: ");
+  Serial.println(WiFi.softAPIP());
+
+  // Web server routes
+  server.on("/", handleRoot);
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+}

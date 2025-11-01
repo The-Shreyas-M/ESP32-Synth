@@ -1,0 +1,98 @@
+#include <Arduino.h>
+
+// --- MATRIX CONFIGURATION ---
+const int NUM_ROWS = 4;
+const int NUM_COLS = 4;
+const int TOTAL_KEYS = NUM_ROWS * NUM_COLS; // 16 keys
+
+// GPIO Pins for Rows (Digital OUTPUT - Drivers)
+// Connect these to the 4 Row pins on your keypad (e.g., R1, R2, R3, R4)
+const int rowPins[NUM_ROWS] = {15, 2, 4, 5}; 
+
+// GPIO Pins for Columns (Digital INPUT_PULLUP - Sensors)
+// Connect these to the 4 Column pins on your keypad (e.g., C1, C2, C3, C4)
+const int colPins[NUM_COLS] = {18, 19, 21, 22}; 
+
+// Key Names for the 4x4 layout
+const char* keyNames[NUM_ROWS][NUM_COLS] = {
+    {"C4", "C#4", "D4", "D#4"},
+    {"E4", "F4", "F#4", "G4"},
+    {"G#4", "A4", "A#4", "B4"},
+    {"C5", "C#5", "D5", "D#5"}  // Four keys left over for the 16th key (D#5)
+};
+
+// State tracking for all 16 keys (true/false for pressed/released)
+bool keyState[TOTAL_KEYS] = {false}; 
+String lastOutputString = "";
+
+
+void setup() {
+    Serial.begin(115200);
+    Serial.println("Starting 4x4 Keypad Matrix Scan (Polyphony Ready)");
+
+    // Setup Row Pins (OUTPUT)
+    for (int i = 0; i < NUM_ROWS; i++) {
+        pinMode(rowPins[i], OUTPUT);
+        digitalWrite(rowPins[i], HIGH); // Rows start HIGH (active-HIGH drive logic)
+    }
+    
+    // Setup Column Pins (INPUT_PULLUP)
+    for (int i = 0; i < NUM_COLS; i++) {
+        // Since the physical keypad connects to the columns, we use INPUT_PULLUP
+        pinMode(colPins[i], INPUT_PULLUP);
+    }
+}
+
+void loop() {
+    String currentOutputString = "";
+    bool stateChanged = false;
+
+    // --- 1. SCAN THE 4x4 MATRIX ---
+    for (int row = 0; row < NUM_ROWS; row++) {
+        
+        // ACTIVATE the current Row: Drive it LOW (Standard Keypad Library Logic)
+        digitalWrite(rowPins[row], LOW); 
+        delayMicroseconds(10); // Settle time
+
+        // READ all 4 Columns
+        for (int col = 0; col < NUM_COLS; col++) {
+            int keyIndex = (row * NUM_COLS) + col; 
+            
+            // LOW = Pressed (Row is LOW, pulls the INPUT_PULLUP LOW)
+            bool isPressed = (digitalRead(colPins[col]) == LOW);
+            
+            // Track state change
+            if (isPressed != keyState[keyIndex]) {
+                keyState[keyIndex] = isPressed;
+                stateChanged = true;
+            }
+        }
+
+        // DEACTIVATE the current Row: Drive it back HIGH
+        digitalWrite(rowPins[row], HIGH); 
+    }
+
+    // --- 2. BUILD THE OUTPUT STRING (Polyphony Check) ---
+    for(int i = 0; i < TOTAL_KEYS; i++) {
+        if (keyState[i]) {
+            if (currentOutputString.length() > 0) {
+                currentOutputString += ", ";
+            }
+            
+            int row = i / NUM_COLS; 
+            int col = i % NUM_COLS; 
+            currentOutputString += keyNames[row][col];
+        }
+    }
+
+    // --- 3. PRINT ONLY IF THE COMBINATION CHANGED ---
+    if (currentOutputString != lastOutputString) {
+        if (currentOutputString.length() == 0) {
+            Serial.println("None");
+            lastOutputString = "None";
+        } else {
+            Serial.println(currentOutputString);
+            lastOutputString = currentOutputString;
+        }
+    }
+}

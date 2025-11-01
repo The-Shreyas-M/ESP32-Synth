@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ESP32 Synth Controller</title>
+  <style>
+    body {
+      font-family: 'Segoe UI', sans-serif;
+      background: #121212;
+      color: #f0f0f0;
+      margin: 0;
+      padding: 2rem;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+    h1 {
+      margin-bottom: 1rem;
+      font-weight: 400;
+      color: #ffffff;
+    }
+    .waveform-selector {
+      display: flex;
+      align-items: center;
+      margin: 1rem;
+    }
+    select#waveformDropdown {
+      background: #1e1e1e;
+      color: #f0f0f0;
+      padding: 0.5rem;
+      font-size: 1rem;
+      border: 1px solid #333;
+      border-radius: 0.3rem;
+      margin-left: 1rem;
+    }
+    canvas.waveform-preview {
+      width: 80px;
+      height: 40px;
+      background: #1e1e1e;
+      border: 1px solid #444;
+      margin-left: 1rem;
+    }
+    .knob-container {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 2rem;
+      margin-top: 2rem;
+    }
+    .knob {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      color: #ccc;
+    }
+    .knob input[type=range] {
+      -webkit-appearance: none;
+      width: 80px;
+      height: 80px;
+      border-radius: 50%;
+      background: radial-gradient(circle at center, #1e1e1e 40%, #333 100%);
+      transform: rotate(-135deg);
+    }
+    .knob input[type=range]::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 16px;
+      height: 16px;
+      background: #00e0ff;
+      border-radius: 50%;
+      cursor: pointer;
+    }
+    #fullscreenBtn {
+      background: #444;
+      color: #fff;
+      margin-top: 2rem;
+      padding: 0.7rem 1.2rem;
+      font-size: 1rem;
+      border: none;
+      border-radius: 0.5rem;
+      cursor: pointer;
+    }
+  </style>
+</head>
+<body>
+  <h1>ESP32 Synth Controller</h1>
+
+  <div class="waveform-selector">
+    <label for="waveformDropdown">Waveform:</label>
+    <select id="waveformDropdown">
+      <option value="sine">🔊</option>
+      <option value="square">⬛</option>
+      <option value="triangle">🔺</option>
+      <option value="sawtooth">📈</option>
+    </select>
+    <canvas class="waveform-preview" id="waveformCanvas"></canvas>
+  </div>
+
+  <div class="knob-container">
+    <div class="knob">
+      <label for="attack">Attack</label>
+      <input type="range" id="attack" min="0" max="1000" value="100">
+    </div>
+    <div class="knob">
+      <label for="decay">Decay</label>
+      <input type="range" id="decay" min="0" max="1000" value="100">
+    </div>
+    <div class="knob">
+      <label for="sustain">Sustain</label>
+      <input type="range" id="sustain" min="0" max="100" value="80">
+    </div>
+    <div class="knob">
+      <label for="release">Release</label>
+      <input type="range" id="release" min="0" max="1000" value="200">
+    </div>
+  </div>
+
+  <button id="fullscreenBtn" onclick="openFullscreen()">🖵 Fullscreen</button>
+
+  <script>
+    const waveformDropdown = document.getElementById("waveformDropdown");
+    const waveformCanvas = document.getElementById("waveformCanvas");
+
+    const update = () => {
+      const waveform = waveformDropdown.value;
+      const data = {
+        waveform,
+        attack: parseInt(document.getElementById('attack').value),
+        decay: parseInt(document.getElementById('decay').value),
+        sustain: parseInt(document.getElementById('sustain').value),
+        release: parseInt(document.getElementById('release').value)
+      };
+      console.log("Sending:", data); // Replace with fetch/WebSocket later
+    };
+
+    waveformDropdown.addEventListener("change", () => {
+      drawWaveform(waveformCanvas, waveformDropdown.value);
+      update();
+    });
+
+    ["attack", "decay", "sustain", "release"].forEach(id => {
+      document.getElementById(id).addEventListener("input", update);
+    });
+
+    function openFullscreen() {
+      const el = document.documentElement;
+      if (el.requestFullscreen) {
+        el.requestFullscreen();
+      } else if (el.webkitRequestFullscreen) {
+        el.webkitRequestFullscreen();
+      } else if (el.msRequestFullscreen) {
+        el.msRequestFullscreen();
+      }
+    }
+
+    function drawWaveform(canvas, type) {
+      const ctx = canvas.getContext("2d");
+      const w = canvas.width;
+      const h = canvas.height;
+      ctx.clearRect(0, 0, w, h);
+      ctx.beginPath();
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = '#00e0ff';
+
+      if (type === 'sine') {
+        for (let x = 0; x < w; x++) {
+          const y = h / 2 + Math.sin((x / w) * 2 * Math.PI) * h / 3;
+          x === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+        }
+      } else if (type === 'square') {
+        ctx.moveTo(0, h * 0.25);
+        ctx.lineTo(w / 2, h * 0.25);
+        ctx.lineTo(w / 2, h * 0.75);
+        ctx.lineTo(w, h * 0.75);
+      } else if (type === 'triangle') {
+        ctx.moveTo(0, h / 2);
+        ctx.lineTo(w / 4, 0);
+        ctx.lineTo(w / 2, h);
+        ctx.lineTo((3 * w) / 4, 0);
+        ctx.lineTo(w, h);
+      } else if (type === 'sawtooth') {
+        ctx.moveTo(0, h);
+        ctx.lineTo(w, 0);
+      }
+
+      ctx.stroke();
+    }
+
+    drawWaveform(waveformCanvas, waveformDropdown.value);
+  </script>
+</body>
+</html>

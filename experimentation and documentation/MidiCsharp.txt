@@ -1,0 +1,67 @@
+#include <MIDI.h>
+#include "HardwareSerial.h"
+#include <math.h>
+
+// Define the MIDI object to use a specific hardware serial port
+MIDI_CREATE_INSTANCE(HardwareSerial, Serial1, MIDI);
+
+// DAC pin for audio output
+const int dacPin = 25;
+
+// Global variables to track the current note being played
+volatile int currentNote = -1;
+volatile double currentDelay = 0;
+
+// The MIDI library will call this function when a "Note On" message is detected
+void handleNoteOn(byte channel, byte note, byte velocity) {
+  if (velocity > 0) {
+    if (note >= 0 && note < 128) {
+      double frequency = 440.0 * pow(2.0, (note - 69) / 12.0);
+      currentDelay = 1000000.0 / (2.0 * frequency);
+      currentNote = note;
+    }
+  } else {
+    handleNoteOff(channel, note, velocity);
+  }
+}
+
+// The MIDI library will call this function when a "Note Off" message is detected
+void handleNoteOff(byte channel, byte note, byte velocity) {
+  if (note == currentNote) {
+    currentNote = -1;
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial1.begin(31250); 
+  
+  // Set up the MIDI library to call our functions
+  MIDI.setHandleNoteOn(handleNoteOn);
+  MIDI.setHandleNoteOff(handleNoteOff);
+  
+  // Begin listening on all MIDI channels
+  MIDI.begin(MIDI_CHANNEL_OMNI);
+}
+
+void loop() {
+  // Simulate pressing C4
+  handleNoteOn(1, 61, 100);
+  
+  // Run the core loop for 200ms to play the note
+  unsigned long endTime = millis() + 200;
+  while (millis() < endTime) {
+    if (currentNote != -1) {
+      dacWrite(dacPin, 255);
+      delayMicroseconds(currentDelay);
+      dacWrite(dacPin, 0);
+      delayMicroseconds(currentDelay);
+    }
+  }
+  
+  // Simulate releasing C4
+  handleNoteOff(1, 61, 0);
+  
+  // Pause before the loop repeats
+  delay(200);
+}

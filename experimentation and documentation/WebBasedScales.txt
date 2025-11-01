@@ -1,0 +1,108 @@
+/*
+  ESP32 DAC - Web Controlled Scale Player
+  - Starts WiFi AP (hotspot)
+  - Webpage has buttons for scales
+  - Scales play via DAC on GPIO25
+  - Stop button silences DAC
+*/
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DacESP32.h>
+
+// === WiFi Hotspot Config ===
+const char* ssid = "ESP32-Hotspot";
+const char* password = "12345678";
+
+// === DAC Setup (GPIO25) ===
+DacESP32 dac1(GPIO_NUM_25);
+const double CORR = 0.9128;
+
+// === Web Server ===
+WebServer server(80);
+
+// === State Tracking ===
+volatile bool playing = false;
+volatile int scaleId = -1;
+
+// === C Major Scale ===
+double notesC[] = {
+  261.63, 293.66, 329.63, 349.23,
+  392.00, 440.00, 493.88, 523.25
+};
+
+// === Another Example Scale (G Major) ===
+double notesG[] = {
+  392.00, 440.00, 493.88, 523.25,
+  587.33, 659.25, 739.99, 783.99
+};
+
+// ================= HTML Page =================
+String generateHTML() {
+  String html = "<!DOCTYPE html><html><head><title>ESP32 Scales</title>";
+  html += "<style>body{font-family:Arial;text-align:center;}";
+  html += "button{padding:15px;margin:10px;font-size:18px;}";
+  html += ".stop{background:#f44336;color:white;}</style></head><body>";
+  html += "<h1>ESP32 Scale Player</h1>";
+  html += "<p><b>Currently Playing:</b> ";
+  html += (playing ? (scaleId==0?"C Major":"G Major") : "None");
+  html += "</p>";
+  html += "<a href=\"/playC\"><button>C Major</button></a>";
+  html += "<a href=\"/playG\"><button>G Major</button></a>";
+  html += "<a href=\"/stop\"><button class=\"stop\">STOP</button></a>";
+  html += "</body></html>";
+  return html;
+}
+
+// === HTTP Handlers ===
+void handleRoot() { server.send(200, "text/html", generateHTML()); }
+
+void handlePlayC() { playing = true; scaleId = 0; server.sendHeader("Location","/",true); server.send(302,""); }
+void handlePlayG() { playing = true; scaleId = 1; server.sendHeader("Location","/",true); server.send(302,""); }
+void handleStop()  { playing = false; scaleId = -1; dac1.outputCW(0); server.sendHeader("Location","/",true); server.send(302,""); }
+
+// === Setup ===
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  // WiFi Hotspot
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(ssid, password);
+  Serial.print("Hotspot IP: "); Serial.println(WiFi.softAPIP());
+
+  // Web routes
+  server.on("/", handleRoot);
+  server.on("/playC", handlePlayC);
+  server.on("/playG", handlePlayG);
+  server.on("/stop", handleStop);
+  server.begin();
+
+  // DAC init
+  dac1.setCwScale(DAC_CW_SCALE_8); // safe amplitude
+}
+
+// === Main Loop ===
+void loop() {
+  server.handleClient();
+
+  if (playing) {
+    double* currentNotes;
+    if (scaleId == 0) currentNotes = notesC;
+    else if (scaleId == 1) currentNotes = notesG;
+    else return;
+
+    // play ascending
+    for (int i = 0; i < 8 && playing; i++) {
+      dac1.outputCW(currentNotes[i] * CORR);
+      delay(5000);
+      server.handleClient();
+    }
+    // play descending
+    for (int i = 7; i >= 0 && playing; i--) {
+      dac1.outputCW(currentNotes[i] * CORR);
+      delay(5000);
+      server.handleClient();
+    }
+  }
+}

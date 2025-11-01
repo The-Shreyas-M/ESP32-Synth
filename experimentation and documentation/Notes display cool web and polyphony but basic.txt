@@ -1,0 +1,648 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include "driver/i2s.h"
+#include "driver/dac.h" 
+#include <math.h>
+
+// --- WIFI CONFIGURATION (Change these) ---
+const char* ssid = "APSIT_SYNTH";
+const char* password = "MINIPROJECT";
+WebServer server(80);
+
+// --- AUDIO/I2S Configuration ---
+#define I2S_PORT I2S_NUM_0
+#define I2S_SAMPLE_RATE 44100
+#define SINE_TABLE_SIZE 512
+#define DMA_BUF_LEN 64 
+#define AUDIO_BUFFER_SIZE (DMA_BUF_LEN * 2) // Stereo (L+R)
+#define MAX_POLYPHONY_VOICES 16 // 4x4 keys
+
+// Global I2S Configuration
+const i2s_config_t i2s_config = {
+  .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_DAC_BUILT_IN),
+  .sample_rate = I2S_SAMPLE_RATE,
+  .bits_per_sample = (i2s_bits_per_sample_t)16,
+  .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+  .communication_format = (i2s_comm_format_t)I2S_COMM_FORMAT_STAND_MSB,
+  .intr_alloc_flags = 0,
+  .dma_buf_count = 8,
+  .dma_buf_len = DMA_BUF_LEN,
+  .use_apll = false, // Use internal clock
+};
+
+// --- SYNTHESIS GLOBALS ---
+float sineTable[SINE_TABLE_SIZE];
+float masterVolume = 0.5; // Master volume control (0.0 to 1.0)
+const double CORR = 1.0; // Correction factor
+
+struct Voice {
+    bool active = false;        // Is this voice currently playing a note?
+    double freq = 0.0;          // Current frequency
+    float phase = 0.0;          // Current phase position in the sine table (0.0 to 1.0)
+    float phaseIncrement = 0.0; // How much to advance phase per sample
+    int keyIndex = -1;          // The index of the key playing this voice (0-15)
+};
+
+Voice voices[MAX_POLYPHONY_VOICES];
+
+// --- KEY MATRIX CONFIGURATION ---
+const int NUM_ROWS = 4;
+const int NUM_COLS = 4;
+const int TOTAL_KEYS = NUM_ROWS * NUM_COLS; 
+
+const int rowPins[NUM_ROWS] = {15, 2, 4, 5}; 
+const int colPins[NUM_COLS] = {18, 19, 21, 22}; 
+
+const char* keyNames[NUM_ROWS][NUM_COLS] = {
+    {"C4", "C#4", "D4", "D#4"},
+    {"E4", "F4", "F#4", "G4"},
+    {"G#4", "A4", "A#4", "B4"},
+    {"C5", "C#5", "D5", "D#5"}
+};
+
+// State tracking for all 16 keys (true/false for pressed/released)
+volatile bool keyState[TOTAL_KEYS] = {false};
+
+// Musical Notes (A4 = 440 Hz)
+const double baseNotes[] = {
+  261.63, 277.18, 293.66, 311.13, 329.63, 349.23, 369.99, 392.00, 415.30, 440.00, 466.16, 493.88
+};
+const int baseNoteCount = 12;
+
+// Map key index (0-15) to musical parameters
+struct KeyMap {
+    int noteIndex; // index into baseNotes (0-11)
+    int octave;    // e.g., 0 for C4, 1 for C5
+};
+
+KeyMap keyMappings[TOTAL_KEYS];
+
+// --- FUNCTION PROTOTYPES ---
+void initI2S();
+void initSineTable();
+void renderAudio(int16_t* buffer, size_t num_samples);
+void audioTask(void *parameter);
+void mapScaleToKeypad();
+void scanKeypad();
+void updateVoices();
+void handleRoot();
+void handleSetSettings();
+void handleStatus();
+String getActiveNoteStatusJson();
+
+// --- EMBEDDED WEB SERVER HTML (The fix for your file issue!) ---
+// This large string contains the entire web page (HTML, CSS, JS)
+const char INDEX_HTML[] = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESP32 Polyphonic Synth Control</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { font-family: 'Inter', sans-serif; background-color: #0d1117; color: #c9d1d9; }
+        .key-status-container {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 8px;
+            max-width: 400px;
+            margin: 0 auto;
+        }
+        .key-tile {
+            padding: 1rem;
+            border-radius: 0.5rem;
+            text-align: center;
+            font-weight: bold;
+            background-color: #21262d;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            transition: all 0.1s ease-in-out;
+            cursor: pointer;
+        }
+        .key-tile.active {
+            background-color: #238636;
+            color: #ffffff;
+            transform: scale(1.05);
+            box-shadow: 0 0 10px #238636;
+        }
+        #log-box {
+            max-height: 200px;
+            overflow-y: scroll;
+            background-color: #161b22;
+            padding: 1rem;
+            border-radius: 0.5rem;
+            border: 1px solid #30363d;
+        }
+        /* Custom track style for slider */
+        input[type=range]::-webkit-slider-runnable-track {
+            background: #30363d;
+            border-radius: 4px;
+            height: 8px;
+        }
+    </style>
+</head>
+<body class="p-4 sm:p-8">
+
+    <div class="max-w-xl mx-auto space-y-8">
+        <header class="text-center space-y-2">
+            <h1 class="text-3xl font-extrabold text-white">ESP32 Polyphonic Synth</h1>
+            <p class="text-gray-400">Control and status for the hardware matrix keyboard.</p>
+        </header>
+
+        <!-- Control Panel -->
+        <div class="p-6 bg-[#161b22] rounded-xl shadow-2xl border border-[#30363d] space-y-4">
+            <h2 class="text-xl font-semibold text-white">Master Controls (Noise Reduction)</h2>
+            
+            <div>
+                <label for="volume-slider" class="block mb-2 text-sm font-medium text-gray-300">Volume (<span id="volume-label">50%</span>)</label>
+                <input type="range" id="volume-slider" min="0" max="100" value="50" step="1" class="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer range-lg">
+            </div>
+
+            <button id="set-volume-btn" class="w-full py-2 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded-lg transition duration-150 shadow-md">
+                Set Volume (Reduces Noise)
+            </button>
+            <p id="volume-status" class="text-sm text-green-400 text-center"></p>
+        </div>
+
+        <!-- Key Status Display -->
+        <div class="p-6 bg-[#161b22] rounded-xl shadow-2xl border border-[#30363d] space-y-4">
+            <h2 class="text-xl font-semibold text-white">Hardware Key Status (Polyphony Check)</h2>
+            <p class="text-sm text-gray-400">Tiles highlighted in green are keys currently pressed on the ESP32 matrix.</p>
+            
+            <div id="key-status-display" class="key-status-container">
+                <!-- Key tiles will be dynamically inserted here -->
+            </div>
+            
+            <p id="active-notes" class="text-center font-mono text-lg text-yellow-300 min-h-6">No Notes Playing</p>
+        </div>
+
+        <!-- Activity Log -->
+        <div class="space-y-2">
+            <h2 class="text-lg font-semibold text-white">Activity Log</h2>
+            <div id="log-box" class="text-xs text-gray-500 font-mono">
+                Log started...
+            </div>
+        </div>
+
+    </div>
+
+    <script>
+        // The IP address will be the one assigned to the ESP32 in Access Point mode.
+        const esp32IP = window.location.hostname; 
+        const volumeSlider = document.getElementById('volume-slider');
+        const volumeLabel = document.getElementById('volume-label');
+        const setVolumeBtn = document.getElementById('set-volume-btn');
+        const volumeStatus = document.getElementById('volume-status');
+        const keyDisplay = document.getElementById('key-status-display');
+        const activeNotesDisplay = document.getElementById('active-notes');
+        const logBox = document.getElementById('log-box');
+
+        const KEY_MAP = [
+            'C4', 'C#4', 'D4', 'D#4',
+            'E4', 'F4', 'F#4', 'G4',
+            'G#4', 'A4', 'A#4', 'B4',
+            'C5', 'C#5', 'D5', 'D#5'
+        ];
+        
+        // --- Utility Functions ---
+
+        function log(message) {
+            const now = new Date().toLocaleTimeString();
+            const p = document.createElement('p');
+            p.textContent = `[${now}] ${message}`;
+            logBox.prepend(p);
+        }
+
+        function createKeyTiles() {
+            keyDisplay.innerHTML = '';
+            KEY_MAP.forEach((note, index) => {
+                const tile = document.createElement('div');
+                tile.className = 'key-tile';
+                tile.id = `key-${index}`;
+                tile.textContent = note;
+                keyDisplay.appendChild(tile);
+            });
+        }
+        
+        // --- Volume Control ---
+
+        volumeSlider.addEventListener('input', () => {
+            volumeLabel.textContent = `${volumeSlider.value}%`;
+        });
+
+        setVolumeBtn.addEventListener('click', async () => {
+            const rawVolume = volumeSlider.value;
+            const scaledVolume = rawVolume / 100.0;
+            const url = `http://${esp32IP}/setSettings?volume=${scaledVolume}`;
+            
+            setVolumeBtn.disabled = true;
+            volumeStatus.textContent = 'Setting volume...';
+
+            try {
+                // Implementing simple retry logic with exponential backoff for robustness
+                const maxRetries = 3;
+                let response = null;
+                for (let i = 0; i < maxRetries; i++) {
+                    try {
+                        response = await fetch(url);
+                        if (response.ok) break;
+                    } catch (e) {
+                        // Wait (1s, 2s, 4s) before retry
+                        if (i < maxRetries - 1) await new Promise(resolve => setTimeout(resolve, Math.pow(2, i) * 1000));
+                        else throw e; // Re-throw error on last attempt
+                    }
+                }
+                
+                if (response && response.ok) {
+                    volumeStatus.textContent = `Volume set successfully to ${rawVolume}%! Noise reduction applied.`;
+                    log(`Volume set to ${rawVolume}%`);
+                } else {
+                    volumeStatus.textContent = `Error setting volume: ${response ? response.statusText : 'Unknown error'}`;
+                    log(`ERROR: Could not set volume: ${response ? response.statusText : 'Unknown error'}`);
+                }
+            } catch (error) {
+                volumeStatus.textContent = 'Connection Error. Check ESP32 status.';
+                log(`ERROR: Fetch failed for volume control: ${error.message}`);
+            } finally {
+                setVolumeBtn.disabled = false;
+                setTimeout(() => volumeStatus.textContent = '', 3000);
+            }
+        });
+
+
+        // --- Status Polling (Polyphony Check) ---
+        
+        let lastActiveKeys = []; // Array of note strings (e.g., ['C4', 'E4'])
+
+        async function updateStatus() {
+            try {
+                // Implementing simple retry logic with exponential backoff for robustness
+                const maxRetries = 3;
+                let response = null;
+                for (let i = 0; i < maxRetries; i++) {
+                    try {
+                        response = await fetch(`http://${esp32IP}/status`);
+                        if (response.ok) break;
+                    } catch (e) {
+                        // Wait (1s, 2s, 4s) before retry
+                        if (i < maxRetries - 1) await new Promise(resolve => setTimeout(resolve, Math.pow(2, i) * 1000));
+                        else throw e; // Re-throw error on last attempt
+                    }
+                }
+                
+                if (!response || !response.ok) {
+                     throw new Error(`HTTP status ${response ? response.status : 'No response'}`);
+                }
+                
+                const activeNotes = await response.json(); // Expects a JSON array of active notes
+
+                // 1. Update Key Tiles
+                const currentActiveKeys = activeNotes.map(note => note.note);
+                
+                KEY_MAP.forEach((note, index) => {
+                    const tile = document.getElementById(`key-${index}`);
+                    if (currentActiveKeys.includes(note)) {
+                        tile.classList.add('active');
+                    } else {
+                        tile.classList.remove('active');
+                    }
+                });
+
+                // 2. Update Active Notes Display
+                if (currentActiveKeys.length > 0) {
+                    activeNotesDisplay.textContent = currentActiveKeys.join(' + ');
+                } else {
+                    activeNotesDisplay.textContent = 'No Notes Playing';
+                }
+
+                // 3. Log Key Changes (To confirm polyphony is detected)
+                const pressedNow = new Set(currentActiveKeys);
+                const wasPressed = new Set(lastActiveKeys);
+
+                const newlyPressed = currentActiveKeys.filter(note => !wasPressed.has(note));
+                const newlyReleased = lastActiveKeys.filter(note => !pressedNow.has(note));
+
+                if (newlyPressed.length > 0) {
+                    log(`Note ON: ${newlyPressed.join(', ')}`);
+                }
+                if (newlyReleased.length > 0) {
+                    log(`Note OFF: ${newlyReleased.join(', ')}`);
+                }
+                
+                lastActiveKeys = currentActiveKeys;
+
+            } catch (error) {
+                activeNotesDisplay.textContent = 'CONNECTION ERROR';
+                // Only log error once to prevent spamming
+                if (!logBox.firstChild || !logBox.firstChild.textContent.includes("Polling failed")) {
+                    log(`Polling failed: ${error.message}. Is ESP32 running and connected?`);
+                }
+            }
+        }
+
+        // --- Initialization ---
+
+        window.onload = () => {
+            createKeyTiles();
+            // Start polling every 50ms for a responsive feel
+            setInterval(updateStatus, 50); 
+            log('Web interface loaded. Starting status poll.');
+        };
+    </script>
+</body>
+</html>
+)rawliteral";
+
+// --- I2S & AUDIO FUNCTIONS ---
+
+void initSineTable() {
+  for (int i = 0; i < SINE_TABLE_SIZE; i++) {
+    sineTable[i] = sin(((float)i / SINE_TABLE_SIZE) * 2.0 * M_PI);
+  }
+}
+
+void initI2S() {
+  // Install and start I2S driver
+  i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
+  // Enable DAC output
+  dac_output_enable(DAC_CHANNEL_1); // Right channel DAC pin (GPIO25)
+  dac_output_enable(DAC_CHANNEL_2); // Left channel DAC pin (GPIO26)
+  // Set the DAC data mode to left/right for stereo output
+  i2s_set_dac_mode(I2S_DAC_CHANNEL_BOTH_EN); 
+}
+
+/**
+ * @brief Renders audio data by summing active voices and preventing clipping.
+ * * @param buffer Pointer to the 16-bit I2S output buffer.
+ * @param num_samples The number of 16-bit samples to generate (DMA_BUF_LEN * 2).
+ */
+void renderAudio(int16_t* buffer, size_t num_samples) {
+    // DAC_Built_In mode uses 16-bit data, but only the MSB (most significant byte) is used.
+    // Full scale for the 8-bit DAC is 127.
+    // Max 16-bit value is 32767. We aim for 8-bit max output, scaled.
+    const float amplitude = 127.0; 
+
+    for (size_t i = 0; i < num_samples / 2; i++) {
+        // Use 32-bit for summation to prevent temporary overflow during mixing
+        int32_t sample_sum = 0; 
+        
+        for (int v = 0; v < MAX_POLYPHONY_VOICES; v++) {
+            if (voices[v].active) {
+                // Calculate sample
+                int tableIndex = (int)(voices[v].phase * SINE_TABLE_SIZE);
+                float sample_value = sineTable[tableIndex] * amplitude; 
+
+                // Add to sum
+                sample_sum += (int32_t)sample_value;
+
+                // Advance phase
+                voices[v].phase += voices[v].phaseIncrement;
+                if (voices[v].phase >= 1.0) {
+                    voices[v].phase -= 1.0;
+                }
+            }
+        }
+
+        // --- NOISE FIX: CRITICAL SCALING TO PREVENT CLIPPING ---
+        // 1. Scale the sum down by the maximum number of voices (16)
+        // 2. Apply master volume control
+        // 3. Keep the output safely within the 8-bit DAC range (0-255). 
+        // We use 16-bit buffer, but the DAC only uses MSB, so 8-bit range is key.
+        int16_t scaled_sample = (int16_t)((float)sample_sum / MAX_POLYPHONY_VOICES * masterVolume * 256.0);
+        
+        // Final clamping to prevent any unexpected overflow (shouldn't happen with the scaling)
+        if (scaled_sample > 32767) scaled_sample = 32767;
+        if (scaled_sample < -32768) scaled_sample = -32768;
+
+        // Write the same sample to both Left (buffer[i*2]) and Right (buffer[i*2+1]) for mono output
+        buffer[i * 2] = scaled_sample;   // Left Channel (DAC Channel 2 / GPIO 26)
+        buffer[i * 2 + 1] = scaled_sample; // Right Channel (DAC Channel 1 / GPIO 25)
+    }
+}
+
+
+void audioTask(void *parameter) {
+  // Buffer for I2S data (16-bit samples)
+  int16_t* i2s_write_buffer = (int16_t*)malloc(AUDIO_BUFFER_SIZE * sizeof(int16_t));
+  if (i2s_write_buffer == NULL) {
+    Serial.println("Failed to allocate audio buffer!");
+    vTaskDelete(NULL);
+    return;
+  }
+  
+  size_t bytes_written = 0;
+
+  while (1) {
+    renderAudio(i2s_write_buffer, AUDIO_BUFFER_SIZE);
+    
+    // Write data to I2S/DAC
+    i2s_write(I2S_PORT, 
+              i2s_write_buffer, 
+              AUDIO_BUFFER_SIZE * sizeof(int16_t), 
+              &bytes_written, 
+              portMAX_DELAY);
+  }
+}
+
+// --- KEYPAD & VOICE MANAGEMENT ---
+
+void mapScaleToKeypad() {
+    // C4 - D#5 chromatic scale over 16 keys (4x4 matrix)
+    for (int i = 0; i < TOTAL_KEYS; i++) {
+        // C4 is index 0 (261.63Hz)
+        // Note: The structure of your keyNames implies C4 at 0, C#4 at 1, etc.
+        // The notes advance chromatically across the matrix.
+        keyMappings[i].noteIndex = i % baseNoteCount; // 0-11
+        keyMappings[i].octave = 0; // All notes are in the 4th octave (baseNotes are C4-B4)
+        
+        // Adjust for notes that spill over into the next octave (C5, C#5, D5, D#5)
+        if (i >= baseNoteCount) {
+             keyMappings[i].octave = 1;
+             keyMappings[i].noteIndex = i - baseNoteCount;
+        }
+    }
+}
+
+/**
+ * @brief Scans the 4x4 matrix and updates the global keyState array.
+ * This is a standard row-scan method that supports polyphony.
+ */
+void scanKeypad() {
+    for (int row = 0; row < NUM_ROWS; row++) {
+        // ACTIVATE the current Row: Drive it LOW (active low logic for PULLUP)
+        digitalWrite(rowPins[row], LOW); 
+        delayMicroseconds(10); // Settle time
+
+        // READ all 4 Columns
+        for (int col = 0; col < NUM_COLS; col++) {
+            int keyIndex = (row * NUM_COLS) + col; 
+            
+            // LOW = Pressed (Row is LOW, pulls the INPUT_PULLUP LOW)
+            bool isPressed = (digitalRead(colPins[col]) == LOW);
+            
+            // Only update the global state if it has changed
+            keyState[keyIndex] = isPressed; 
+        }
+
+        // DEACTIVATE the current Row: Drive it back HIGH
+        digitalWrite(rowPins[row], HIGH); 
+    }
+}
+
+/**
+ * @brief Manages the 16 voice objects based on the global keyState array.
+ * Assigns voices to newly pressed keys and releases voices for released keys.
+ */
+void updateVoices() {
+    for (int i = 0; i < TOTAL_KEYS; i++) {
+        bool keyIsPressed = keyState[i];
+        
+        // 1. Key is pressed: Try to find a voice or activate a voice
+        if (keyIsPressed) {
+            bool voiceFound = false;
+            // Check if this key already owns a voice
+            for (int v = 0; v < MAX_POLYPHONY_VOICES; v++) {
+                if (voices[v].active && voices[v].keyIndex == i) {
+                    voiceFound = true;
+                    break;
+                }
+            }
+            
+            // If key is newly pressed (voice not found), find a free voice
+            if (!voiceFound) {
+                for (int v = 0; v < MAX_POLYPHONY_VOICES; v++) {
+                    if (!voices[v].active) {
+                        // Activate new voice
+                        voices[v].active = true;
+                        voices[v].keyIndex = i;
+                        
+                        // Calculate frequency and phase increment
+                        double newFreq = baseNotes[keyMappings[i].noteIndex] * pow(2, keyMappings[i].octave) * CORR;
+                        voices[v].freq = newFreq;
+                        voices[v].phaseIncrement = newFreq / I2S_SAMPLE_RATE;
+                        voices[v].phase = 0.0; // Reset phase for click-free start
+                        
+                        break; // Voice assigned
+                    }
+                }
+            }
+        } 
+        // 2. Key is released: Deactivate the associated voice
+        else {
+            for (int v = 0; v < MAX_POLYPHONY_VOICES; v++) {
+                if (voices[v].active && voices[v].keyIndex == i) {
+                    voices[v].active = false;
+                    voices[v].keyIndex = -1;
+                    voices[v].freq = 0.0;
+                    // Note: No ADSR/release phase here for simplicity. Voice is instantly off.
+                    break;
+                }
+            }
+        }
+    }
+}
+
+// --- WEB SERVER FUNCTIONS ---
+
+void handleRoot() {
+  // *** FIX: Serve the entire HTML content from the C++ file ***
+  server.send(200, "text/html", INDEX_HTML);
+}
+
+/**
+ * @brief New status handler that returns a JSON array of all currently active notes.
+ */
+String getActiveNoteStatusJson() {
+    String json = "[";
+    bool first = true;
+    for (int v = 0; v < MAX_POLYPHONY_VOICES; v++) {
+        if (voices[v].active) {
+            if (!first) {
+                json += ",";
+            }
+            int row = voices[v].keyIndex / NUM_COLS;
+            int col = voices[v].keyIndex % NUM_COLS;
+            
+            json += "{\"note\":\"";
+            json += keyNames[row][col];
+            json += "\",\"freq\":";
+            json += String(voices[v].freq, 2);
+            json += "}";
+            first = false;
+        }
+    }
+    json += "]";
+    return json;
+}
+
+void handleStatus() {
+    server.send(200, "application/json", getActiveNoteStatusJson());
+}
+
+void handleSetSettings() {
+    if (server.hasArg("volume")) {
+        masterVolume = server.arg("volume").toFloat();
+        masterVolume = constrain(masterVolume, 0.0, 1.0);
+        Serial.print("Master Volume Set: ");
+        Serial.println(masterVolume);
+    }
+    server.send(200, "text/plain", "Settings updated.");
+}
+
+
+// --- MAIN FUNCTIONS ---
+
+void setup() {
+  Serial.begin(115200);
+  
+  // 1. Setup Matrix Pins
+  for (int i = 0; i < NUM_ROWS; i++) {
+    pinMode(rowPins[i], OUTPUT);
+    digitalWrite(rowPins[i], HIGH); // Start HIGH (inactive)
+  }
+  for (int i = 0; i < NUM_COLS; i++) {
+    pinMode(colPins[i], INPUT_PULLUP); // Enable internal pull-up resistors
+  }
+  
+  // 2. Initialize Musical Scale and Waveform
+  mapScaleToKeypad();
+  initSineTable();
+
+  // 3. Initialize I2S Audio
+  initI2S();
+
+  // 4. WiFi AP and Server Setup
+  WiFi.softAP(ssid, password);
+  Serial.print("Hotspot started: ");
+  Serial.println(ssid);
+  Serial.print("Connect phone/PC to this network. IP: ");
+  Serial.println(WiFi.softAPIP());
+
+  // 5. Web Server Routes
+  server.on("/", handleRoot);
+  server.on("/setSettings", handleSetSettings);
+  server.on("/status", handleStatus);
+  server.begin();
+
+  // 6. Create the audio task and pin it to Core 1
+  xTaskCreatePinnedToCore(
+    audioTask,      
+    "AudioTask",    
+    10000,          
+    NULL,           
+    1,              
+    NULL,           
+    1               
+  );
+}
+
+void loop() {
+  server.handleClient(); // Web Server handling on Core 0
+  
+  // High-speed key matrix scan and voice update on Core 0
+  scanKeypad(); 
+  updateVoices();
+  
+  // Add a small delay so Core 0 doesn't starve the web server and task manager
+  delay(10); 
+}

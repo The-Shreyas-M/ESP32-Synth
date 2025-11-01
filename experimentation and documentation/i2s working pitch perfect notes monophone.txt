@@ -1,0 +1,202 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include "driver/i2s.h"
+#include "driver/dac.h" // Needed for DAC_CHANNEL_1/2 and dac_output_enable
+#include <math.h>
+
+// --- I2S Configuration & Audio Constants ---
+#define I2S_PORT I2S_NUM_0
+#define I2S_SAMPLE_RATE 44100
+#define SINE_TABLE_SIZE 512
+#define DMA_BUF_LEN 64 // Use a fixed constant for the DMA buffer size
+#define AUDIO_BUFFER_SIZE (DMA_BUF_LEN * 2) // 64 buffers * 2 channels
+
+// Global I2S Configuration (to be used by the audio task)
+const i2s_config_t i2s_config = {
+  .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_DAC_BUILT_IN),
+  .sample_rate = I2S_SAMPLE_RATE,
+  .bits_per_sample = (i2s_bits_per_sample_t)16,
+  .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+  .communication_format = (i2s_comm_format_t)I2S_COMM_FORMAT_STAND_MSB,
+  .intr_alloc_flags = 0,
+  .dma_buf_count = 8,
+  .dma_buf_len = DMA_BUF_LEN, // Use the constant
+  .use_apll = false 
+};
+
+// --- Global Audio State (Accessed by both cores) ---
+volatile double targetFreq = 0.0;
+volatile bool noteIsPlaying = false;
+int16_t sineWave[SINE_TABLE_SIZE]; // Sine lookup table
+double phaseAccumulator = 0.0;     // Current position in the sine wave
+// FIX: audioBuffer size must be a constant, not derived from the struct
+int16_t audioBuffer[AUDIO_BUFFER_SIZE]; 
+
+// --- Control Logic Globals ---
+const char* ssid = "ESP-Synth";
+const char* password = "12345678";
+WebServer server(80);
+double baseNotes[] = { 
+  261.63, 277.18, 293.66, 311.13, 329.63, 349.23,
+  369.99, 392.00, 415.30, 440.00, 466.16, 493.88
+};
+const double CORR = 1;
+
+// Buttons structure and definition (must be defined globally)
+struct Button {
+  int pin;
+  int noteIndex;
+  int octave;
+  const char* label;
+};
+
+Button buttons[] = {
+  {15, 6, 0, "F#"}, {33, 0, 0, "C"}, {4, 2, 0, "D"}, {5, 4, 0, "E"},
+  {18, 5, 0, "F"}, {19, 7, 0, "G"}, {21, 9, 0, "A"}, {22, 11, 0, "B"},
+  {23, 0, 1, "C (high)"}, {13, 10, 0, "A#"}, {12, 8, 0, "G#"},
+  {14, 3, 0, "D#"}, {27, 1, 0, "C#"}
+};
+
+const int numButtons = sizeof(buttons) / sizeof(buttons[0]); // FIX: buttons is now defined
+
+String currentNote = "None";
+unsigned long lastReleaseTime = 0;
+bool waitingForRelease = false;
+
+
+// --- Audio Generation Task (Runs on Core 1) ---
+void audioTask(void *parameter) {
+  // 1. Pre-calculate Sine Wave Lookup Table (16-bit signed)
+  for (int i = 0; i < SINE_TABLE_SIZE; i++) {
+    sineWave[i] = (int16_t)(sin(i * 2.0 * PI / SINE_TABLE_SIZE) * 32767);
+  }
+
+  // 2. Install I2S Driver
+  i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
+  i2s_set_pin(I2S_PORT, NULL); 
+  // Explicitly enable DAC pins 
+  dac_output_enable(DAC_CHANNEL_1); // FIX: dac.h included, so this works now
+  dac_output_enable(DAC_CHANNEL_2); 
+
+  while (true) {
+    if (noteIsPlaying) {
+      double freq = targetFreq;
+      
+      double phaseIncrement = freq * SINE_TABLE_SIZE / I2S_SAMPLE_RATE;
+      
+      // Calculate how many samples to fill in the buffer
+      int samplesToGenerate = i2s_config.dma_buf_len; 
+      
+      for (int i = 0; i < samplesToGenerate; i++) {
+        int16_t sample16Bit = sineWave[(int)phaseAccumulator];
+        
+        // Downscale 16-bit sample to 8-bit unsigned and place in MSB for DAC
+        uint8_t sample8Bit = (uint8_t)((sample16Bit >> 8) + 128); 
+        int16_t final_sample = sample8Bit << 8;
+
+        // Place the sample in the stereo buffer 
+        audioBuffer[i * 2] = final_sample;     // DAC 25
+        audioBuffer[i * 2 + 1] = final_sample; // DAC 26
+
+        phaseAccumulator += phaseIncrement;
+        if (phaseAccumulator >= SINE_TABLE_SIZE) {
+          phaseAccumulator -= SINE_TABLE_SIZE;
+        }
+      }
+
+      // Write the audio buffer to the I2S peripheral
+      size_t bytes_written;
+      i2s_write(I2S_PORT, audioBuffer, sizeof(audioBuffer), &bytes_written, portMAX_DELAY);
+    } else {
+      // Write silence and pause briefly
+      size_t bytes_written;
+      memset(audioBuffer, 0, sizeof(audioBuffer));
+      i2s_write(I2S_PORT, audioBuffer, sizeof(audioBuffer), &bytes_written, portMAX_DELAY);
+      vTaskDelay(1); 
+    }
+  }
+}
+
+
+// --- Control Logic and Setup (Runs on Core 0) ---
+
+void handleRoot() {
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<meta http-equiv='refresh' content='1'>";
+  html += "<title>ESP32 Synth</title></head><body>";
+  html += "<h2>Playing: " + currentNote + "</h2>";
+  html += "</body></html>";
+  server.send(200, "text/html", html);
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // Setup button pins
+  for (int i = 0; i < numButtons; i++) {
+    pinMode(buttons[i].pin, INPUT_PULLUP);
+  }
+
+  // WiFi AP and Server
+  WiFi.softAP(ssid, password);
+  Serial.println("Hotspot started: " + String(ssid));
+  Serial.print("IP: ");
+  Serial.println(WiFi.softAPIP());
+  server.on("/", handleRoot);
+  server.begin();
+
+  // Create the audio task and pin it to Core 1
+  xTaskCreatePinnedToCore(
+    audioTask,      
+    "AudioTask",    
+    10000,          
+    NULL,           
+    1,              
+    NULL,           
+    1               
+  );
+}
+
+void loop() {
+  server.handleClient(); // Web Server handling on Core 0
+
+  bool foundPressed = false;
+  double newFreq = 0;
+  String newNote = "None";
+
+  // Fast button scan
+  for (int i = 0; i < numButtons; i++) {
+    if (digitalRead(buttons[i].pin) == LOW) {
+      newFreq = baseNotes[buttons[i].noteIndex] * pow(2, buttons[i].octave) * CORR;
+      newNote = buttons[i].label;
+      foundPressed = true;
+      break; // monophonic
+    }
+  }
+
+  if (foundPressed) {
+    waitingForRelease = false;
+    if (newFreq != targetFreq) {
+      // Update the global variables (which Core 1 reads)
+      targetFreq = newFreq;
+      noteIsPlaying = true;
+      currentNote = newNote;
+      Serial.println("Playing: " + currentNote + " (" + String(targetFreq) + " Hz)");
+    }
+  } else {
+    if (targetFreq != 0.0 && !waitingForRelease) {
+      lastReleaseTime = millis();
+      waitingForRelease = true;
+    }
+
+    // After 100ms of release, stop the sound
+    if (waitingForRelease && (millis() - lastReleaseTime > 100)) {
+      // Set globals to stop audio output on Core 1
+      targetFreq = 0.0;
+      noteIsPlaying = false; 
+      currentNote = "None";
+      waitingForRelease = false;
+      Serial.println("Silence");
+    }
+  }
+}

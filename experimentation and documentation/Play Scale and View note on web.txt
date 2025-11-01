@@ -1,0 +1,128 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DacESP32.h>
+
+// ===== WiFi hotspot =====
+const char* ssid = "ESP-Synth";
+const char* password = "12345678";
+
+// Web server
+WebServer server(80);
+
+// ===== DAC =====
+DacESP32 dac1(GPIO_NUM_25);
+const double CORR = 0.9128;
+
+// ===== Notes (C major as base) =====
+double baseNotes[] = {
+  261.63, // C
+  277.18, // C#
+  293.66, // D
+  311.13, // D#
+  329.63, // E
+  349.23, // F
+  369.99, // F#
+  392.00, // G
+  415.30, // G#
+  440.00, // A
+  466.16, // A#
+  493.88  // B
+};
+
+// ===== Buttons + mapping =====
+struct Button {
+  int pin;
+  int noteIndex;
+  int octave;
+  const char* label;
+};
+
+Button buttons[] = {
+  {15, 6,  0, "F#"},
+  {33, 0,  0, "C"},
+  {4,  2,  0, "D"},
+  {5,  4,  0, "E"},
+  {18, 5,  0, "F"},
+  {19, 7,  0, "G"},
+  {21, 9,  0, "A"},
+  {22, 11, 0, "B"},
+  {23, 0,  1, "C (high)"},
+  {13, 10,  0, "A#"},
+  {12, 8,  0, "G#"},
+  {14, 3,  0, "D#"},
+  {27, 1,  0, "C#"}
+};
+
+const int numButtons = sizeof(buttons) / sizeof(buttons[0]);
+
+// Track currently playing note
+String currentNote = "None";
+double currentFreq = 0;
+
+// ===== Webpage handler =====
+void handleRoot() {
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<meta http-equiv='refresh' content='1'>";
+  html += "<title>ESP32 Synth</title></head><body>";
+  html += "<h2>Playing: " + currentNote + "</h2>";
+  html += "</body></html>";
+  server.send(200, "text/html", html);
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // Setup button pins
+  for (int i = 0; i < numButtons; i++) {
+    pinMode(buttons[i].pin, INPUT_PULLUP);
+  }
+
+  // WiFi AP
+  WiFi.softAP(ssid, password);
+  Serial.println("Hotspot started: " + String(ssid));
+  Serial.print("IP: ");
+  Serial.println(WiFi.softAPIP());
+
+  // Server
+  server.on("/", handleRoot);
+  server.begin();
+
+  // DAC config
+  dac1.setCwScale(DAC_CW_SCALE_4);
+  dac1.outputCW(0); // start silent
+}
+
+void loop() {
+  server.handleClient();
+
+  bool foundPressed = false;
+  double newFreq = 0;
+  String newNote = "None";
+
+  // Fast button scan
+  for (int i = 0; i < numButtons; i++) {
+    if (digitalRead(buttons[i].pin) == LOW) { // pressed
+      newFreq = baseNotes[buttons[i].noteIndex] * pow(2, buttons[i].octave) * CORR;
+      newNote = buttons[i].label;
+      foundPressed = true;
+      break; // monophonic: first pressed button wins
+    }
+  }
+
+  // Update only if changed
+  if (foundPressed) {
+    if (newFreq != currentFreq) {
+      dac1.outputCW(newFreq);
+      currentFreq = newFreq;
+      currentNote = newNote;
+      Serial.println("Playing: " + currentNote + " (" + String(currentFreq) + " Hz)");
+    }
+  } else {
+    if (currentFreq != 0) { // only silence if was playing
+      dac1.outputCW(0);
+      currentFreq = 0;
+      currentNote = "None";
+      Serial.println("Silence");
+    }
+  }
+}

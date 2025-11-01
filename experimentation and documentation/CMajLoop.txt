@@ -1,0 +1,45 @@
+/*
+  ESP32 DAC - C Major Scale
+  Uses DacESP32 library CW mode
+*/
+
+#include <DacESP32.h>
+
+// DAC pin (GPIO25 or GPIO26)
+DacESP32 dac1(GPIO_NUM_25);
+
+// correction factor for ESP32 CW generator
+const double CORR = 0.9128;  
+
+// C major scale frequencies
+double notes[] = {
+  261.63, // C4
+  293.66, // D4
+  329.63, // E4
+  349.23, // F4
+  392.00, // G4
+  440.00, // A4
+  493.88, // B4
+  523.25  // C5
+};
+
+void setup() {}
+
+void loop() {
+
+  dac1.setCwScale(DAC_CW_SCALE_8);
+
+  for (int i = 0; i < 8; i++) {
+    dac1.outputCW(notes[i] * CORR);
+    delay(1500);  // note length in ms
+  }
+
+  delay(2000); // pause before repeating
+
+  for (int i = 7; i > -1; i--) {
+    dac1.outputCW(notes[i] * CORR);
+    delay(1500);  // note length in ms
+  }
+
+  delay(2000);
+}

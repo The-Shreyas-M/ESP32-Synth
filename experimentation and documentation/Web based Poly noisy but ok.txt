@@ -1,0 +1,618 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include "driver/i2s.h"
+#include "driver/dac.h" 
+#include <math.h>
+
+// --- WIFI CONFIGURATION (Change these) ---
+const char* ssid = "APSIT_SYNTH";
+const char* password = "MINIPROJECT";
+WebServer server(80);
+
+// --- AUDIO/I2S Configuration ---
+#define I2S_PORT I2S_NUM_0
+#define I2S_SAMPLE_RATE 44100
+#define SINE_TABLE_SIZE 512
+#define DMA_BUF_LEN 64 
+#define AUDIO_BUFFER_SIZE (DMA_BUF_LEN * 2) // Stereo (L+R)
+#define MAX_POLYPHONY_VOICES 16 // 4x4 keys
+
+// Global I2S Configuration
+const i2s_config_t i2s_config = {
+  .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_DAC_BUILT_IN),
+  .sample_rate = I2S_SAMPLE_RATE,
+  .bits_per_sample = (i2s_bits_per_sample_t)16,
+  .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+  .communication_format = (i2s_comm_format_t)I2S_COMM_FORMAT_STAND_MSB,
+  .intr_alloc_flags = 0,
+  .dma_buf_count = 8,
+  .dma_buf_len = DMA_BUF_LEN, 
+  .use_apll = false 
+};
+
+// --- SYNTHESIS GLOBALS (Volatile for shared access) ---
+volatile int attackTimeMs = 50;
+volatile int decayTimeMs = 50;
+volatile double sustainLevel = 0.5; // 0.0 to 1.0
+volatile int releaseTimeMs = 500;
+volatile double osc1Volume = 0.8;
+volatile double osc2Volume = 0.4;
+volatile double filterFreq = 1000.0;
+volatile double filterResonance = 0.7; // Not fully used in this simple filter
+volatile int filterType = 0; // 0=LP, 1=HP (Only LP is approximated)
+
+// Look-up table for sine wave and phase accumulation
+int16_t sineWave[SINE_TABLE_SIZE]; 
+int16_t audioBuffer[AUDIO_BUFFER_SIZE]; 
+double phaseAccumulators[MAX_POLYPHONY_VOICES] = {0.0}; // Phase per note
+
+// Note State Structure
+struct NoteState {
+    double freq = 0.0;
+    long pressTime = 0;
+    long releaseTime = 0;
+    double currentAmplitude = 0.0;
+    bool isPressed = false; // Is key physically down
+    bool isPlaying = false; // Is note active (either pressed or in RELEASE phase)
+};
+volatile NoteState noteStates[MAX_POLYPHONY_VOICES];
+
+// Musical Mapping Globals
+volatile int rootNoteIndex = 0; // 0=C, 1=C#, etc.
+volatile int scaleType = 0;     // 0=Major, 1=Minor, 2=Pentatonic
+double chromaticFrequencies[12] = { 
+  261.63, 277.18, 293.66, 311.13, 329.63, 349.23,
+  369.99, 392.00, 415.30, 440.00, 466.16, 493.88
+};
+double currentNoteFrequencies[MAX_POLYPHONY_VOICES]; // Frequencies mapped to the 4x4 grid
+
+// Key Names for Console/Web Output
+const char* keyLabels[4][4] = {
+    {"K1", "K2", "K3", "K4"},
+    {"K5", "K6", "K7", "K8"},
+    {"K9", "K10", "K11", "K12"},
+    {"K13", "K14", "K15", "K16"}
+};
+String currentNoteStatus = "None"; // Tracks which notes are visually pressed
+
+// --- MATRIX CONFIGURATION (4x4 Keypad) ---
+const int NUM_ROWS = 4;
+const int NUM_COLS = 4;
+const int rowPins[NUM_ROWS] = {15, 2, 4, 5}; 
+const int colPins[NUM_COLS] = {18, 19, 21, 22}; 
+
+// --- FILTER STATE (Simple 1st-Order LP Filter) ---
+double previous_filtered_sample = 0.0;
+
+
+// --- HELPER FUNCTIONS ---
+
+// Function to map the selected scale and root note to the 4x4 matrix
+void mapScaleToKeypad() {
+  // Intervals (semitones)
+  const int majorScale[7] = {0, 2, 4, 5, 7, 9, 11};
+  const int minorScale[7] = {0, 2, 3, 5, 7, 8, 10};
+  const int pentatonicScale[5] = {0, 2, 4, 7, 9};
+
+  int* intervals = nullptr;
+  int numIntervals = 0;
+
+  switch (scaleType) {
+    case 0: // Major
+      intervals = (int*)majorScale;
+      numIntervals = 7;
+      break;
+    case 1: // Minor
+      intervals = (int*)minorScale;
+      numIntervals = 7;
+      break;
+    case 2: // Pentatonic
+      intervals = (int*)pentatonicScale;
+      numIntervals = 5;
+      break;
+    default:
+      return;
+  }
+
+  // Map 16 keys (4 rows * 4 cols)
+  for (int i = 0; i < MAX_POLYPHONY_VOICES; i++) {
+    // Octave 0 is the base octave (C4-B4), Octave 1 is C5+
+    int octaveShift = i / numIntervals;
+    int noteIndex = intervals[i % numIntervals];
+    
+    // Calculate the absolute semitone index from the root note
+    int absoluteSemitone = (rootNoteIndex + noteIndex) % 12;
+    int baseOctave = 4 + (rootNoteIndex + noteIndex) / 12; // Start from C4 (index 0)
+
+    // Calculate the final frequency: Base frequency * 2^OctaveShift
+    // The frequency is derived from the chromatic array at the calculated index
+    currentNoteFrequencies[i] = chromaticFrequencies[absoluteSemitone] * pow(2, baseOctave - 4 + octaveShift);
+  }
+}
+
+// Calculates the current envelope amplitude (0.0 to 1.0)
+double calculateEnvelope(int voiceIndex) {
+    if (!noteStates[voiceIndex].isPlaying) return 0.0;
+
+    long currentTime = millis();
+    long timeSincePress = currentTime - noteStates[voiceIndex].pressTime;
+    
+    // --- RELEASE ---
+    if (!noteStates[voiceIndex].isPressed && noteStates[voiceIndex].releaseTime > 0) {
+        long timeSinceRelease = currentTime - noteStates[voiceIndex].releaseTime;
+        if (timeSinceRelease >= releaseTimeMs) {
+            noteStates[voiceIndex].isPlaying = false; // Note stops playing
+            return 0.0;
+        }
+        // Linear fade from current amplitude to 0
+        return noteStates[voiceIndex].currentAmplitude * (1.0 - (double)timeSinceRelease / releaseTimeMs);
+    }
+    
+    // --- ATTACK ---
+    if (timeSincePress <= attackTimeMs) {
+        // Linear fade from 0 to 1.0
+        noteStates[voiceIndex].currentAmplitude = (double)timeSincePress / attackTimeMs;
+    } 
+    // --- DECAY ---
+    else if (timeSincePress <= attackTimeMs + decayTimeMs) {
+        long timeInDecay = timeSincePress - attackTimeMs;
+        // Linear fade from 1.0 down to Sustain Level
+        noteStates[voiceIndex].currentAmplitude = 1.0 - (1.0 - sustainLevel) * ((double)timeInDecay / decayTimeMs);
+    } 
+    // --- SUSTAIN ---
+    else {
+        // Hold at Sustain Level
+        noteStates[voiceIndex].currentAmplitude = sustainLevel;
+    }
+
+    return noteStates[voiceIndex].currentAmplitude;
+}
+
+// Simple 1st-order Low Pass Filter approximation
+double applyLPFilter(double current_sample, double cutoff_freq) {
+    // Convert cutoff frequency to a coefficient alpha
+    // Alpha is proportional to the cutoff frequency and sample rate
+    // T = 1/SampleRate, RC = 1/(2*pi*cutoff_freq)
+    // alpha = T / (T + RC)
+    double alpha = 1.0 / (1.0 + (I2S_SAMPLE_RATE / (2.0 * PI * cutoff_freq)));
+    
+    double filtered = previous_filtered_sample + alpha * (current_sample - previous_filtered_sample);
+    previous_filtered_sample = filtered;
+    return filtered;
+}
+
+
+// --- CORE 1: AUDIO GENERATION TASK ---
+void audioTask(void *parameter) {
+  // 1. Pre-calculate Sine Wave Lookup Table (16-bit signed)
+  for (int i = 0; i < SINE_TABLE_SIZE; i++) {
+    sineWave[i] = (int16_t)(sin(i * 2.0 * PI / SINE_TABLE_SIZE) * 32767);
+  }
+
+  // 2. Install I2S Driver
+  i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
+  i2s_set_pin(I2S_PORT, NULL); 
+  dac_output_enable(DAC_CHANNEL_1); // GPIO 25
+  dac_output_enable(DAC_CHANNEL_2); // GPIO 26
+
+  while (true) {
+    
+    size_t bytes_written;
+    int samplesToGenerate = i2s_config.dma_buf_len;
+    
+    for (int i = 0; i < samplesToGenerate; i++) {
+        double final_mixed_sample_f = 0.0;
+        
+        // --- Polyphonic Mixing Loop ---
+        for (int k = 0; k < MAX_POLYPHONY_VOICES; k++) {
+            if (noteStates[k].isPlaying) {
+                
+                // 1. ADSR Envelope
+                double envelope = calculateEnvelope(k);
+                
+                if (envelope > 0.001) {
+                    
+                    // 2. Waveform Generation (Additive Synthesis)
+                    double freq = noteStates[k].freq;
+                    double phaseIncrement = freq * SINE_TABLE_SIZE / I2S_SAMPLE_RATE;
+
+                    // OSC 1 (Base Sine)
+                    int tableIndex1 = (int)phaseAccumulators[k];
+                    double sample1 = (double)sineWave[tableIndex1] * envelope * osc1Volume / 32767.0;
+
+                    // OSC 2 (Octave Up - Simple Harmonic)
+                    int tableIndex2 = (int)(phaseAccumulators[k] * 2.0) % SINE_TABLE_SIZE;
+                    double sample2 = (double)sineWave[tableIndex2] * envelope * osc2Volume / 32767.0;
+
+                    // Sum and accumulate
+                    final_mixed_sample_f += (sample1 + sample2);
+                    
+                    // Update phase
+                    phaseAccumulators[k] += phaseIncrement;
+                    if (phaseAccumulators[k] >= SINE_TABLE_SIZE) {
+                        phaseAccumulators[k] -= SINE_TABLE_SIZE;
+                    }
+                }
+            }
+        }
+        
+        // --- Global Filter (Simplified Low-Pass) ---
+        // We only implement LPF for simplicity and performance
+        if (filterType == 0) { // LPF selected
+            final_mixed_sample_f = applyLPFilter(final_mixed_sample_f, filterFreq);
+        }
+        
+        // --- Final Sample Output ---
+        // Clamp and scale the final sample to 16-bit DAC range (0-255 scaled to 0-65535)
+        // Max output range is limited by polyphony summation to prevent clipping.
+        int16_t sample16Bit = (int16_t)(final_mixed_sample_f * 16383.0); // 16383 is safe scaling
+
+        // Convert 16-bit sample to 8-bit unsigned for DAC and shift to MSB
+        uint8_t sample8Bit = (uint8_t)((sample16Bit >> 8) + 128); 
+        int16_t final_sample = sample8Bit << 8;
+
+        // Place the sample in the stereo buffer 
+        audioBuffer[i * 2] = final_sample;     // DAC 25
+        audioBuffer[i * 2 + 1] = final_sample; // DAC 26
+
+    }
+
+    // Write the audio buffer to the I2S peripheral
+    i2s_write(I2S_PORT, audioBuffer, sizeof(audioBuffer), &bytes_written, portMAX_DELAY);
+  }
+}
+
+// --- CORE 0: MATRIX SCAN & WEB SERVER ---
+
+// Matrix Scan Function
+void scanMatrix() {
+    String pressedKeys = "";
+    int pressedCount = 0;
+
+    for (int row = 0; row < NUM_ROWS; row++) {
+        
+        digitalWrite(rowPins[row], LOW); 
+        delayMicroseconds(10); 
+
+        for (int col = 0; col < NUM_COLS; col++) {
+            int keyIndex = (row * NUM_COLS) + col; 
+            bool isPressed = (digitalRead(colPins[col]) == LOW);
+            
+            if (isPressed) {
+                pressedCount++;
+                if (pressedKeys.length() > 0) pressedKeys += ", ";
+                pressedKeys += keyLabels[row][col];
+                
+                // --- PRESS EVENT ---
+                if (!noteStates[keyIndex].isPressed) {
+                    noteStates[keyIndex].isPressed = true;
+                    noteStates[keyIndex].isPlaying = true; // Start playing
+                    noteStates[keyIndex].pressTime = millis();
+                    noteStates[keyIndex].releaseTime = 0; // Clear release time
+                    noteStates[keyIndex].freq = currentNoteFrequencies[keyIndex]; // Set frequency from mapped scale
+                    phaseAccumulators[keyIndex] = 0.0; // Reset phase for clean attack
+                }
+            } else {
+                // --- RELEASE EVENT ---
+                if (noteStates[keyIndex].isPressed) {
+                    noteStates[keyIndex].isPressed = false;
+                    noteStates[keyIndex].releaseTime = millis();
+                }
+            }
+        }
+        digitalWrite(rowPins[row], HIGH); 
+    }
+    
+    // Console output for debugging
+    if (pressedKeys != currentNoteStatus) {
+        currentNoteStatus = pressedKeys.length() > 0 ? pressedKeys : "None";
+        Serial.print("Keys: ");
+        Serial.println(currentNoteStatus);
+    }
+}
+
+// Handler for the web settings (GET requests)
+void handleSetSettings() {
+    // ADSR
+    if (server.hasArg("A")) attackTimeMs = server.arg("A").toInt();
+    if (server.hasArg("D")) decayTimeMs = server.arg("D").toInt();
+    if (server.hasArg("S")) sustainLevel = server.arg("S").toDouble();
+    if (server.hasArg("R")) releaseTimeMs = server.arg("R").toInt();
+    
+    // Oscillators
+    if (server.hasArg("V1")) osc1Volume = server.arg("V1").toDouble();
+    if (server.hasArg("V2")) osc2Volume = server.arg("V2").toDouble();
+
+    // Filter
+    if (server.hasArg("FQ")) filterFreq = server.arg("FQ").toDouble();
+    if (server.hasArg("RS")) filterResonance = server.arg("RS").toDouble(); // Stored but not used much
+    if (server.hasArg("FT")) filterType = server.arg("FT").toInt(); 
+    
+    // Scale
+    if (server.hasArg("RT")) rootNoteIndex = server.arg("RT").toInt();
+    if (server.hasArg("SC")) scaleType = server.arg("SC").toInt();
+    
+    // Re-map the keyboard immediately if musical settings changed
+    if (server.hasArg("RT") || server.hasArg("SC")) {
+        mapScaleToKeypad();
+    }
+
+    server.send(200, "text/plain", "Settings updated.");
+}
+
+// Handler for the main web page (full HTML/CSS/JS)
+void handleRoot() {
+    String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Group 2 Mini Project APSIT - ESP32 Synth</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; background-color: #f0f0f5; color: #333; margin: 0; padding: 20px; }
+  .container { max-width: 800px; margin: auto; background-color: #fff; padding: 30px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
+  h1 { color: #3949ab; border-bottom: 2px solid #3949ab; padding-bottom: 10px; }
+  h2 { color: #5c6bc0; border-bottom: 1px solid #e0e0e0; padding-bottom: 8px; margin-top: 20px; font-size: 1.4em; }
+  .control-group { margin-bottom: 20px; display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; }
+  .slider-box, .select-box { background-color: #f7f7fa; padding: 15px; border-radius: 8px; border: 1px solid #e0e0e0; transition: box-shadow 0.2s; }
+  .slider-box:hover, .select-box:hover { box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+  label { display: block; font-weight: 600; margin-bottom: 5px; color: #555; font-size: 0.9em; }
+  input[type="range"] { width: 100%; margin: 5px 0 10px 0; -webkit-appearance: none; height: 8px; background: #ddd; border-radius: 5px; }
+  input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 18px; height: 18px; border-radius: 50%; background: #3949ab; cursor: pointer; }
+  select { width: 100%; padding: 8px; border-radius: 4px; border: 1px solid #ccc; background-color: white; font-size: 1em; }
+  .value-display { text-align: center; font-size: 1.1em; font-weight: 700; color: #333; }
+  .footer { text-align: center; margin-top: 40px; padding-top: 20px; border-top: 1px solid #e0e0e0; font-size: 1em; color: #555; font-weight: 600; }
+  .status-bar { padding: 12px; background-color: #e8eaf6; border-radius: 6px; margin-bottom: 20px; font-weight: 700; color: #3949ab; text-align: center; font-size: 1.1em;}
+</style>
+<script>
+  let lastStatus = "";
+
+  // Function to send settings via AJAX GET request
+  function sendSettings() {
+    // ADSR
+    const A = document.getElementById('A').value;
+    const D = document.getElementById('D').value;
+    const S = document.getElementById('S').value;
+    const R = document.getElementById('R').value;
+    
+    // Oscillators
+    const V1 = document.getElementById('V1').value;
+    const V2 = document.getElementById('V2').value;
+
+    // Filter
+    const FQ = document.getElementById('FQ').value;
+    const RS = document.getElementById('RS').value;
+    const FT = document.getElementById('FT').value;
+    
+    // Scale
+    const RT = document.getElementById('RT').value;
+    const SC = document.getElementById('SC').value;
+
+    let url = "/setSettings?";
+    url += `A=${A}&D=${D}&S=${S/10}&R=${R}`;
+    url += `&V1=${V1/10}&V2=${V2/10}`;
+    url += `&FQ=${FQ}&RS=${RS/10}&FT=${FT}`;
+    url += `&RT=${RT}&SC=${SC}`;
+
+    fetch(url)
+      .catch(error => console.error("Error sending settings:", error));
+  }
+
+  // Function to update the number display next to the sliders
+  function updateValue(id, value, scale = 1) {
+    document.getElementById(id + '-value').textContent = (value * scale).toFixed(scale === 1 ? 0 : 1);
+    sendSettings(); 
+  }
+
+  // Fetches the current key status from the server
+  function fetchStatus() {
+    fetch("/status")
+      .then(response => response.text())
+      .then(text => {
+        if (text !== lastStatus) {
+            document.getElementById('status-text').textContent = text;
+            lastStatus = text;
+        }
+      })
+      .catch(error => console.error("Error fetching status:", error));
+  }
+
+
+  window.onload = function() {
+    // Set initial values and add listeners for ALL controls
+    document.querySelectorAll('input[type="range"], select').forEach(control => {
+        
+        // Setup initial display value
+        const displayId = control.id + '-value';
+        const isRange = control.type === 'range';
+        
+        let initialValue;
+        let scale = 1;
+
+        if (isRange) {
+            // Determine scale for volume and sustain
+            if (control.id === 'S' || control.id === 'V1' || control.id === 'V2' || control.id === 'RS') {
+                scale = 0.1;
+            }
+            initialValue = control.value * scale;
+        } else {
+            // For Selects, show the text
+            initialValue = control.options[control.selectedIndex].text;
+        }
+        
+        if(document.getElementById(displayId)) {
+            document.getElementById(displayId).textContent = initialValue.toFixed(scale === 1 ? 0 : 1);
+        }
+
+        // Add event listener for change
+        control.addEventListener('input', (e) => {
+            if (isRange) {
+                updateValue(e.target.id, e.target.value, scale);
+            } else {
+                // Handle selects which trigger settings and display text
+                document.getElementById(displayId).textContent = e.target.options[e.target.selectedIndex].text;
+                sendSettings();
+            }
+        });
+    });
+
+    // Start fetching status every 100ms
+    setInterval(fetchStatus, 100);
+    sendSettings(); // Send initial settings
+  };
+</script>
+</head>
+<body>
+<div class="container">
+  <h1>ESP32 Polyphonic Additive Synthesizer</h1>
+  <div class="status-bar">
+    Keys Pressed: <span id="status-text">...Loading Status...</span>
+  </div>
+
+  <h2>ADSR Envelope (A/D/R in ms, S 0.0-1.0)</h2>
+  <div class="control-group">
+    <div class="slider-box">
+      <label for="A">Attack (A)</label>
+      <input type="range" id="A" min="1" max="1000" value="50">
+      <div class="value-display" id="A-value">50</div>
+    </div>
+    <div class="slider-box">
+      <label for="D">Decay (D)</label>
+      <input type="range" id="D" min="1" max="1000" value="50">
+      <div class="value-display" id="D-value">50</div>
+    </div>
+    <div class="slider-box">
+      <label for="S">Sustain (S)</label>
+      <input type="range" id="S" min="0" max="10" step="1" value="5">
+      <div class="value-display" id="S-value">0.5</div>
+    </div>
+    <div class="slider-box">
+      <label for="R">Release (R)</label>
+      <input type="range" id="R" min="100" max="3000" value="500">
+      <div class="value-display" id="R-value">500</div>
+    </div>
+  </div>
+
+  <h2>Oscillator & Filter Control</h2>
+  <div class="control-group">
+    <div class="slider-box">
+      <label for="V1">Osc 1 Volume</label>
+      <input type="range" id="V1" min="0" max="10" step="1" value="8">
+      <div class="value-display" id="V1-value">0.8</div>
+    </div>
+    <div class="slider-box">
+      <label for="V2">Osc 2 Volume</label>
+      <input type="range" id="V2" min="0" max="10" step="1" value="4">
+      <div class="value-display" id="V2-value">0.4</div>
+    </div>
+    <div class="slider-box">
+      <label for="FQ">Filter Freq (Hz)</label>
+      <input type="range" id="FQ" min="100" max="5000" value="1000">
+      <div class="value-display" id="FQ-value">1000</div>
+    </div>
+    <div class="slider-box">
+      <label for="RS">Filter Resonance</label>
+      <input type="range" id="RS" min="0" max="10" step="1" value="7">
+      <div class="value-display" id="RS-value">0.7</div>
+    </div>
+  </div>
+
+  <h2>Musical Scale Mapping</h2>
+  <div class="control-group" style="grid-template-columns: repeat(3, 1fr);">
+    <div class="select-box">
+      <label for="RT">Root Note</label>
+      <select id="RT">
+        <option value="0">C</option>
+        <option value="1">C#</option>
+        <option value="2">D</option>
+        <option value="3">D#</option>
+        <option value="4">E</option>
+        <option value="5">F</option>
+        <option value="6">F#</option>
+        <option value="7">G</option>
+        <option value="8">G#</option>
+        <option value="9">A</option>
+        <option value="10">A#</option>
+        <option value="11">B</option>
+      </select>
+    </div>
+    <div class="select-box">
+      <label for="SC">Scale Type</label>
+      <select id="SC">
+        <option value="0">Major</option>
+        <option value="1">Minor</option>
+        <option value="2">Pentatonic</option>
+      </select>
+    </div>
+    <div class="select-box">
+      <label for="FT">Filter Type</label>
+      <select id="FT">
+        <option value="0">Low-Pass (LPF)</option>
+        <option value="1">High-Pass (DISABLED)</option>
+      </select>
+    </div>
+  </div>
+</div>
+<div class="footer">
+  Group 2 Mini Project APSIT
+</div>
+</body>
+</html>
+)rawliteral";
+    server.send(200, "text/html", html);
+}
+
+// Handler for the status update (used by JS to update the currently playing notes)
+void handleStatus() {
+    server.send(200, "text/plain", currentNoteStatus);
+}
+
+
+void setup() {
+  Serial.begin(115200);
+
+  // 1. Setup Matrix Pins
+  for (int i = 0; i < NUM_ROWS; i++) {
+    pinMode(rowPins[i], OUTPUT);
+    digitalWrite(rowPins[i], HIGH); 
+  }
+  for (int i = 0; i < NUM_COLS; i++) {
+    pinMode(colPins[i], INPUT_PULLUP);
+  }
+  
+  // 2. Initialize Musical Scale
+  mapScaleToKeypad();
+
+  // 3. WiFi AP and Server Setup
+  // Starting the ESP32 as an Access Point
+  WiFi.softAP(ssid, password);
+  Serial.print("Hotspot started: ");
+  Serial.println(ssid);
+  Serial.print("Connect phone/PC to this network. IP: ");
+  Serial.println(WiFi.softAPIP());
+
+  // 4. Web Server Routes
+  server.on("/", handleRoot);
+  server.on("/setSettings", handleSetSettings);
+  server.on("/status", handleStatus);
+  server.begin();
+
+  // 5. Create the audio task and pin it to Core 1
+  // This ensures audio generation is not interrupted by Wi-Fi/Web Server tasks on Core 0
+  xTaskCreatePinnedToCore(
+    audioTask,      
+    "AudioTask",    
+    20000,          // Increased stack size for complex synth logic
+    NULL,           
+    1,              
+    NULL,           
+    1               // Pin to Core 1
+  );
+  Serial.println("Audio Task started on Core 1.");
+}
+
+void loop() {
+  server.handleClient(); // Web Server handling on Core 0
+  scanMatrix();          // Keypad scanning on Core 0
+  vTaskDelay(pdMS_TO_TICKS(1)); // Briefly yield control
+}

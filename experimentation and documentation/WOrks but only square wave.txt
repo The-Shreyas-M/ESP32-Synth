@@ -1,0 +1,852 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include "driver/i2s.h"
+#include "driver/dac.h" 
+#include <math.h>
+
+// --- WIFI CONFIGURATION (Change these) ---
+const char* ssid = "APSIT_SYNTH";
+const char* password = "MINIPROJECT";
+WebServer server(80);
+
+// --- AUDIO/I2S Configuration ---
+#define I2S_PORT I2S_NUM_0
+#define I2S_SAMPLE_RATE 44100
+#define SINE_TABLE_SIZE 512
+#define DMA_BUF_LEN 64 
+#define AUDIO_BUFFER_SIZE (DMA_BUF_LEN * 2) // Stereo (L+R)
+#define MAX_POLYPHONY_VOICES 16 // 4x4 keys
+
+// Global I2S Configuration
+const i2s_config_t i2s_config = {
+  .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_DAC_BUILT_IN),
+  .sample_rate = I2S_SAMPLE_RATE,
+  .bits_per_sample = (i2s_bits_per_sample_t)16,
+  .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+  .communication_format = (i2s_comm_format_t)I2S_COMM_FORMAT_STAND_MSB,
+  .intr_alloc_flags = 0,
+  .dma_buf_count = 8,
+  .dma_buf_len = DMA_BUF_LEN,
+  .use_apll = false,
+};
+
+// --- SYNTHESIS GLOBALS ---
+float sineTable[SINE_TABLE_SIZE];
+float masterVolume = 0.5;
+const double CORR = 1.0; 
+
+// Parameter mapping for waveforms (must match JS dropdown values)
+enum Waveform { SINE = 0, SQUARE = 1, SAWTOOTH = 2, TRIANGLE = 3 };
+enum ModType { ADDITIVE = 0, AM = 1, FM = 2 };
+
+// Struct to hold all configurable synth parameters from the web UI
+struct SynthParameters {
+    // OSC 1
+    Waveform osc1Waveform = SINE;
+    float osc1Volume = 1.0;
+
+    // OSC 2
+    Waveform osc2Waveform = SINE;
+    float osc2Volume = 1.0;
+    int osc2OctaveOffset = 0; // -2, -1, 0, 1, 2
+
+    // Modulation
+    ModType modulationType = ADDITIVE;
+    float modDepth = 0.0; // 0.0 to 1.0
+};
+
+SynthParameters synthParams;
+
+// Voice struct must now track two oscillators
+struct Voice {
+    bool active = false;        
+    double baseFreq = 0.0;     // Base frequency of the key
+
+    // OSC 1
+    float osc1Phase = 0.0;       
+    float osc1Inc = 0.0;      
+    
+    // OSC 2
+    float osc2Phase = 0.0;
+    float osc2Inc = 0.0;
+    
+    int keyIndex = -1;          
+};
+
+Voice voices[MAX_POLYPHONY_VOICES];
+
+// --- KEY MATRIX CONFIGURATION ---
+const int NUM_ROWS = 4;
+const int NUM_COLS = 4;
+const int TOTAL_KEYS = NUM_ROWS * NUM_COLS; 
+
+const int rowPins[NUM_ROWS] = {15, 2, 4, 5}; 
+const int colPins[NUM_COLS] = {18, 19, 21, 22}; 
+
+const char* keyNames[NUM_ROWS][NUM_COLS] = {
+    {"C4", "C#4", "D4", "D#4"},
+    {"E4", "F4", "F#4", "G4"},
+    {"G#4", "A4", "A#4", "B4"},
+    {"C5", "C#5", "D5", "D#5"}
+};
+
+volatile bool keyState[TOTAL_KEYS] = {false};
+
+// Musical Notes (C4-B4)
+const double baseNotes[] = {
+  261.63, 277.18, 293.66, 311.13, 329.63, 349.23, 369.99, 392.00, 415.30, 440.00, 466.16, 493.88
+};
+const int baseNoteCount = 12;
+
+struct KeyMap {
+    int noteIndex; 
+    int octave;    
+};
+
+KeyMap keyMappings[TOTAL_KEYS];
+
+// --- FUNCTION PROTOTYPES ---
+void initI2S();
+void initSineTable();
+float getWaveformSample(float phase, Waveform wave);
+void renderAudio(int16_t* buffer, size_t num_samples);
+void audioTask(void *parameter);
+void mapScaleToKeypad();
+void scanKeypad();
+void updateVoices();
+void handleRoot();
+void handleSetSettings();
+void handleStatus();
+String getActiveNoteStatusJson();
+
+// --- EMBEDDED WEB SERVER HTML (Updated with Dual OSC/Modulation UI) ---
+const char INDEX_HTML[] = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESP32 Dual-OSC Poly Synth</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { font-family: 'Inter', sans-serif; background-color: #0d1117; color: #c9d1d9; }
+        .key-status-container {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 8px;
+            max-width: 400px;
+            margin: 0 auto;
+        }
+        .key-tile {
+            padding: 1rem;
+            border-radius: 0.5rem;
+            text-align: center;
+            font-weight: bold;
+            background-color: #21262d;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            transition: all 0.1s ease-in-out;
+            cursor: pointer;
+        }
+        .key-tile.active {
+            background-color: #238636;
+            color: #ffffff;
+            transform: scale(1.05);
+            box-shadow: 0 0 10px #238636;
+        }
+        #log-box {
+            max-height: 200px;
+            overflow-y: scroll;
+            background-color: #161b22;
+            padding: 1rem;
+            border-radius: 0.5rem;
+            border: 1px solid #30363d;
+        }
+        /* Custom track style for slider */
+        input[type=range]::-webkit-slider-runnable-track {
+            background: #30363d;
+            border-radius: 4px;
+            height: 8px;
+        }
+    </style>
+</head>
+<body class="p-4 sm:p-8">
+
+    <div class="max-w-xl mx-auto space-y-8">
+        <header class="text-center space-y-2">
+            <h1 class="text-3xl font-extrabold text-white">ESP32 Dual-OSC Mini Synth</h1>
+            <p class="text-gray-400">Advanced settings for hardware polyphonic keyboard.</p>
+        </header>
+
+        <!-- Synth Controls -->
+        <div class="p-6 bg-[#161b22] rounded-xl shadow-2xl border border-[#30363d] space-y-6" id="synth-controls">
+            
+            <h2 class="text-xl font-semibold text-white">Synthesizer Parameters</h2>
+
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                
+                <!-- OSC 1 Controls -->
+                <div class="p-4 bg-gray-800 rounded-lg space-y-3 shadow-inner">
+                    <h3 class="text-lg font-bold text-teal-400">OSCILLATOR 1</h3>
+                    <label class="block text-sm">Waveform</label>
+                    <select id="osc1-waveform" class="w-full p-2 rounded bg-gray-700 border-gray-600 text-white">
+                        <option value="0">Sine (Default)</option>
+                        <option value="1">Square</option>
+                        <option value="2">Sawtooth</option>
+                        <option value="3">Triangle</option>
+                    </select>
+
+                    <label class="block text-sm pt-2">Volume (<span id="osc1-volume-label">100%</span>)</label>
+                    <input type="range" id="osc1-volume" min="0" max="100" value="100" step="1" class="w-full">
+                </div>
+                
+                <!-- OSC 2 Controls -->
+                <div class="p-4 bg-gray-800 rounded-lg space-y-3 shadow-inner">
+                    <h3 class="text-lg font-bold text-fuchsia-400">OSCILLATOR 2</h3>
+                    <label class="block text-sm">Waveform</label>
+                    <select id="osc2-waveform" class="w-full p-2 rounded bg-gray-700 border-gray-600 text-white">
+                        <option value="0">Sine (Default)</option>
+                        <option value="1">Square</option>
+                        <option value="2">Sawtooth</option>
+                        <option value="3">Triangle</option>
+                    </select>
+
+                    <label class="block text-sm pt-2">Volume (<span id="osc2-volume-label">100%</span>)</label>
+                    <input type="range" id="osc2-volume" min="0" max="100" value="100" step="1" class="w-full">
+                    
+                    <label class="block text-sm pt-2">Octave Shift</label>
+                    <select id="osc2-octave" class="w-full p-2 rounded bg-gray-700 border-gray-600 text-white">
+                        <option value="0">0 (Same)</option>
+                        <option value="1">+1 Octave</option>
+                        <option value="-1">-1 Octave</option>
+                        <option value="2">+2 Octave</option>
+                        <option value="-2">-2 Octave</option>
+                    </select>
+                </div>
+
+                <!-- Modulation Controls -->
+                <div class="p-4 bg-gray-800 rounded-lg space-y-3 shadow-inner">
+                    <h3 class="text-lg font-bold text-yellow-400">MODULATION</h3>
+                    <label class="block text-sm">Type</label>
+                    <select id="mod-type" class="w-full p-2 rounded bg-gray-700 border-gray-600 text-white">
+                        <option value="0">Additive (Default)</option>
+                        <option value="1">AM (Amplitude Mod.)</option>
+                        <option value="2">FM (Frequency Mod.)</option>
+                    </select>
+
+                    <label class="block text-sm pt-2">Depth (<span id="mod-depth-label">0%</span>)</label>
+                    <input type="range" id="mod-depth" min="0" max="100" value="0" step="1" class="w-full">
+                    
+                    <label class="block text-sm pt-2">Master Volume (<span id="master-volume-label">50%</span>)</label>
+                    <input type="range" id="master-volume" min="0" max="100" value="50" step="1" class="w-full">
+                </div>
+            </div>
+
+            <button id="set-settings-btn" class="w-full py-3 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded-lg transition duration-150 shadow-md">
+                APPLY ALL SYNTH SETTINGS
+            </button>
+            <p id="settings-status" class="text-sm text-green-400 text-center"></p>
+
+        </div>
+
+        <!-- Key Status Display -->
+        <div class="p-6 bg-[#161b22] rounded-xl shadow-2xl border border-[#30363d] space-y-4">
+            <h2 class="text-xl font-semibold text-white">Hardware Key Status (Polyphony Check)</h2>
+            <p class="text-sm text-gray-400">Tiles highlighted in green are keys currently pressed on the ESP32 matrix.</p>
+            
+            <div id="key-status-display" class="key-status-container">
+                <!-- Key tiles will be dynamically inserted here -->
+            </div>
+            
+            <p id="active-notes" class="text-center font-mono text-lg text-yellow-300 min-h-6">No Notes Playing</p>
+        </div>
+
+        <!-- Activity Log -->
+        <div class="space-y-2">
+            <h2 class="text-lg font-semibold text-white">Activity Log</h2>
+            <div id="log-box" class="text-xs text-gray-500 font-mono">
+                Log started...
+            </div>
+        </div>
+        
+        <!-- Project Footer -->
+        <footer class="text-center pt-8 text-sm text-gray-500">
+            Group 2 Mini Project APSIT
+        </footer>
+
+    </div>
+
+    <script>
+        const esp32IP = window.location.hostname; 
+        const logBox = document.getElementById('log-box');
+        const keyDisplay = document.getElementById('key-status-display');
+        const activeNotesDisplay = document.getElementById('active-notes');
+        const setSettingsBtn = document.getElementById('set-settings-btn');
+        const settingsStatus = document.getElementById('settings-status');
+
+        // Setup for label updates and button logic
+        const CONTROLS = [
+            { id: 'osc1-volume', label: 'osc1-volume-label' },
+            { id: 'osc2-volume', label: 'osc2-volume-label' },
+            { id: 'mod-depth', label: 'mod-depth-label' },
+            { id: 'master-volume', label: 'master-volume-label' },
+        ];
+        
+        CONTROLS.forEach(ctrl => {
+            const slider = document.getElementById(ctrl.id);
+            const label = document.getElementById(ctrl.label);
+            slider.addEventListener('input', () => {
+                label.textContent = `${slider.value}%`;
+            });
+        });
+
+        const KEY_MAP = [
+            'C4', 'C#4', 'D4', 'D#4',
+            'E4', 'F4', 'F#4', 'G4',
+            'G#4', 'A4', 'A#4', 'B4',
+            'C5', 'C#5', 'D5', 'D#5'
+        ];
+        
+        // --- Utility Functions ---
+
+        function log(message) {
+            const now = new Date().toLocaleTimeString();
+            const p = document.createElement('p');
+            p.textContent = `[${now}] ${message}`;
+            logBox.prepend(p);
+        }
+
+        function createKeyTiles() {
+            keyDisplay.innerHTML = '';
+            KEY_MAP.forEach((note, index) => {
+                const tile = document.createElement('div');
+                tile.className = 'key-tile';
+                tile.id = `key-${index}`;
+                tile.textContent = note;
+                keyDisplay.appendChild(tile);
+            });
+        }
+        
+        // --- Settings Control (Send full JSON) ---
+        
+        setSettingsBtn.addEventListener('click', async () => {
+            const settings = {
+                // Scale 0-100 to 0.0-1.0
+                masterVolume: parseFloat(document.getElementById('master-volume').value) / 100.0,
+                
+                // OSC 1
+                osc1Waveform: parseInt(document.getElementById('osc1-waveform').value),
+                osc1Volume: parseFloat(document.getElementById('osc1-volume').value) / 100.0,
+                
+                // OSC 2
+                osc2Waveform: parseInt(document.getElementById('osc2-waveform').value),
+                osc2Volume: parseFloat(document.getElementById('osc2-volume').value) / 100.0,
+                osc2OctaveOffset: parseInt(document.getElementById('osc2-octave').value),
+                
+                // Modulation
+                modulationType: parseInt(document.getElementById('mod-type').value),
+                modDepth: parseFloat(document.getElementById('mod-depth').value) / 100.0,
+            };
+            
+            const url = `http://${esp32IP}/setSettings`;
+            
+            setSettingsBtn.disabled = true;
+            settingsStatus.textContent = 'Applying settings...';
+
+            try {
+                // Use POST request with JSON body
+                const response = await fetch(url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(settings)
+                });
+
+                if (response.ok) {
+                    settingsStatus.textContent = `Settings applied successfully!`;
+                    log(`Settings updated: ${JSON.stringify(settings)}`);
+                } else {
+                    settingsStatus.textContent = `Error applying settings: ${response.statusText}`;
+                    log(`ERROR: Could not apply settings: ${response.statusText}`);
+                }
+            } catch (error) {
+                settingsStatus.textContent = 'Connection Error.';
+                log(`ERROR: Fetch failed for settings control: ${error.message}`);
+            } finally {
+                setSettingsBtn.disabled = false;
+                setTimeout(() => settingsStatus.textContent = '', 3000);
+            }
+        });
+
+
+        // --- Status Polling ---
+        
+        let lastActiveKeys = []; 
+
+        async function updateStatus() {
+            try {
+                const url = `http://${esp32IP}/status`;
+                // Simple exponential backoff retry logic (3 attempts)
+                let response = null;
+                for (let i = 0; i < 3; i++) {
+                    try {
+                        response = await fetch(url);
+                        if (response.ok) break;
+                    } catch (e) {
+                        if (i < 2) await new Promise(resolve => setTimeout(resolve, Math.pow(2, i) * 100));
+                        else throw e;
+                    }
+                }
+                
+                if (!response || !response.ok) {
+                     throw new Error(`HTTP status ${response ? response.status : 'No response'}`);
+                }
+                
+                const activeNotes = await response.json(); 
+
+                const currentActiveKeys = activeNotes.map(note => note.note);
+                
+                KEY_MAP.forEach((note, index) => {
+                    const tile = document.getElementById(`key-${index}`);
+                    if (currentActiveKeys.includes(note)) {
+                        tile.classList.add('active');
+                    } else {
+                        tile.classList.remove('active');
+                    }
+                });
+
+                if (currentActiveKeys.length > 0) {
+                    activeNotesDisplay.textContent = currentActiveKeys.join(' + ');
+                } else {
+                    activeNotesDisplay.textContent = 'No Notes Playing';
+                }
+
+                const pressedNow = new Set(currentActiveKeys);
+                const wasPressed = new Set(lastActiveKeys);
+
+                const newlyPressed = currentActiveKeys.filter(note => !wasPressed.has(note));
+                const newlyReleased = lastActiveKeys.filter(note => !pressedNow.has(note));
+
+                if (newlyPressed.length > 0) {
+                    log(`Note ON: ${newlyPressed.join(', ')}`);
+                }
+                if (newlyReleased.length > 0) {
+                    log(`Note OFF: ${newlyReleased.join(', ')}`);
+                }
+                
+                lastActiveKeys = currentActiveKeys;
+
+            } catch (error) {
+                activeNotesDisplay.textContent = 'CONNECTION ERROR';
+                if (!logBox.firstChild || !logBox.firstChild.textContent.includes("Polling failed")) {
+                    log(`Polling failed: ${error.message}. Is ESP32 running and connected?`);
+                }
+            }
+        }
+
+        // --- Initialization ---
+
+        window.onload = () => {
+            createKeyTiles();
+            setInterval(updateStatus, 50); 
+            log('Web interface loaded. Starting status poll.');
+        };
+    </script>
+</body>
+</html>
+)rawliteral";
+
+// --- I2S & AUDIO FUNCTIONS ---
+
+void initSineTable() {
+  for (int i = 0; i < SINE_TABLE_SIZE; i++) {
+    sineTable[i] = sin(((float)i / SINE_TABLE_SIZE) * 2.0 * M_PI);
+  }
+}
+
+void initI2S() {
+  i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
+  dac_output_enable(DAC_CHANNEL_1); 
+  dac_output_enable(DAC_CHANNEL_2); 
+  i2s_set_dac_mode(I2S_DAC_CHANNEL_BOTH_EN); 
+}
+
+/**
+ * @brief Generates a sample value (-1.0 to 1.0) for a given phase and waveform.
+ */
+float getWaveformSample(float phase, Waveform wave) {
+    // Phase is 0.0 to 1.0
+    float sample = 0.0;
+    
+    switch (wave) {
+        case SINE:
+            // Use lookup table
+            sample = sineTable[(int)(phase * SINE_TABLE_SIZE)];
+            break;
+        case SQUARE:
+            // High or Low based on phase position
+            sample = (phase < 0.5) ? 1.0 : -1.0;
+            break;
+        case SAWTOOTH:
+            // Linear ramp from -1.0 to 1.0
+            sample = (phase * 2.0) - 1.0;
+            break;
+        case TRIANGLE:
+            // Two linear ramps
+            if (phase < 0.5) {
+                sample = (phase * 4.0) - 1.0; // Goes from -1 to 1
+            } else {
+                sample = 1.0 - ((phase - 0.5) * 4.0); // Goes from 1 to -1
+            }
+            break;
+    }
+    return sample;
+}
+
+/**
+ * @brief Renders audio data by summing active voices and preventing clipping.
+ * This is the core synthesis function incorporating dual-osc, waveforms, and modulation.
+ */
+void renderAudio(int16_t* buffer, size_t num_samples) {
+    const float amplitude = 127.0; 
+
+    for (size_t i = 0; i < num_samples / 2; i++) {
+        int32_t sample_sum = 0; 
+        
+        for (int v = 0; v < MAX_POLYPHONY_VOICES; v++) {
+            if (voices[v].active) {
+                
+                float osc1Sample = 0.0;
+                float osc2Sample = 0.0;
+                float finalSample = 0.0;
+                
+                // --- 1. Calculate Samples based on Mod Type ---
+                if (synthParams.modulationType == FM) {
+                    // FM: OSC2 (Modulator) modifies the frequency (phase increment) of OSC1 (Carrier)
+                    
+                    // Advance Modulator (OSC2) phase first
+                    voices[v].osc2Phase += voices[v].osc2Inc;
+                    if (voices[v].osc2Phase >= 1.0) voices[v].osc2Phase -= 1.0;
+                    
+                    // Get Modulator Sample (-1.0 to 1.0)
+                    osc2Sample = getWaveformSample(voices[v].osc2Phase, synthParams.osc2Waveform);
+
+                    // Calculate instantaneous frequency of OSC1 (Carrier)
+                    // Index: Base Freq + (Modulator * Mod Depth * Max Deviation)
+                    float deviation = synthParams.modDepth * 0.1; // Max 10% deviation 
+                    float currentInc = voices[v].osc1Inc + (osc2Sample * deviation);
+
+                    // Advance Carrier (OSC1) phase with modulated increment
+                    voices[v].osc1Phase += currentInc;
+                    if (voices[v].osc1Phase >= 1.0) voices[v].osc1Phase -= 1.0;
+
+                    // Get Carrier Sample and apply its volume
+                    osc1Sample = getWaveformSample(voices[v].osc1Phase, synthParams.osc1Waveform);
+                    finalSample = osc1Sample * synthParams.osc1Volume;
+
+                } else {
+                    // Additive / AM: Standard phase advancement
+
+                    // Advance phases
+                    voices[v].osc1Phase += voices[v].osc1Inc;
+                    if (voices[v].osc1Phase >= 1.0) voices[v].osc1Phase -= 1.0;
+                    voices[v].osc2Phase += voices[v].osc2Inc;
+                    if (voices[v].osc2Phase >= 1.0) voices[v].osc2Phase -= 1.0;
+
+                    // Get raw samples
+                    osc1Sample = getWaveformSample(voices[v].osc1Phase, synthParams.osc1Waveform);
+                    osc2Sample = getWaveformSample(voices[v].osc2Phase, synthParams.osc2Waveform);
+
+                    // Apply Modulation Type
+                    if (synthParams.modulationType == ADDITIVE) {
+                        // Additive Synthesis (Sum of two waves)
+                        finalSample = (osc1Sample * synthParams.osc1Volume) + (osc2Sample * synthParams.osc2Volume);
+                    } else if (synthParams.modulationType == AM) {
+                        // Amplitude Modulation: OSC2 (Modulator) controls the volume of OSC1 (Carrier)
+                        // Modulator goes from [0, 1] based on depth
+                        float modulator = (osc2Sample * synthParams.modDepth) + (1.0 - synthParams.modDepth); 
+                        finalSample = osc1Sample * modulator * synthParams.osc1Volume;
+                    }
+                }
+                
+                // --- 2. Add to Sum and Apply Amplitude Scaling ---
+                // Scale final sample by hardware amplitude
+                sample_sum += (int32_t)(finalSample * amplitude);
+            }
+        }
+
+        // --- NOISE FIX: CRITICAL SCALING TO PREVENT CLIPPING ---
+        // Scale down by MAX_POLYPHONY_VOICES and apply master volume
+        int16_t scaled_sample = (int16_t)((float)sample_sum / MAX_POLYPHONY_VOICES * masterVolume * 256.0);
+        
+        // Final clamping
+        if (scaled_sample > 32767) scaled_sample = 32767;
+        if (scaled_sample < -32768) scaled_sample = -32768;
+
+        // Write mono sample
+        buffer[i * 2] = scaled_sample;   
+        buffer[i * 2 + 1] = scaled_sample; 
+    }
+}
+
+
+void audioTask(void *parameter) {
+  int16_t* i2s_write_buffer = (int16_t*)malloc(AUDIO_BUFFER_SIZE * sizeof(int16_t));
+  if (i2s_write_buffer == NULL) {
+    vTaskDelete(NULL);
+    return;
+  }
+  
+  size_t bytes_written = 0;
+
+  while (1) {
+    renderAudio(i2s_write_buffer, AUDIO_BUFFER_SIZE);
+    i2s_write(I2S_PORT, i2s_write_buffer, AUDIO_BUFFER_SIZE * sizeof(int16_t), &bytes_written, portMAX_DELAY);
+  }
+}
+
+// --- KEYPAD & VOICE MANAGEMENT ---
+
+void mapScaleToKeypad() {
+    for (int i = 0; i < TOTAL_KEYS; i++) {
+        keyMappings[i].noteIndex = i % baseNoteCount; 
+        keyMappings[i].octave = 0; 
+        if (i >= baseNoteCount) {
+             keyMappings[i].octave = 1;
+             keyMappings[i].noteIndex = i - baseNoteCount;
+        }
+    }
+}
+
+void scanKeypad() {
+    for (int row = 0; row < NUM_ROWS; row++) {
+        digitalWrite(rowPins[row], LOW); 
+        delayMicroseconds(10); 
+        for (int col = 0; col < NUM_COLS; col++) {
+            int keyIndex = (row * NUM_COLS) + col; 
+            bool isPressed = (digitalRead(colPins[col]) == LOW);
+            keyState[keyIndex] = isPressed; 
+        }
+        digitalWrite(rowPins[row], HIGH); 
+    }
+}
+
+/**
+ * @brief Calculates and sets phase increments for both OSCs when a voice is activated.
+ */
+void setupVoicePitches(Voice& voice, int keyIndex) {
+    // 1. Calculate Base Frequency (C4 or C5)
+    double baseFreq = baseNotes[keyMappings[keyIndex].noteIndex] * pow(2, keyMappings[keyIndex].octave) * CORR;
+    voice.baseFreq = baseFreq;
+
+    // 2. OSC 1 Increment (Base pitch)
+    voice.osc1Inc = baseFreq / I2S_SAMPLE_RATE;
+    voice.osc1Phase = 0.0;
+
+    // 3. OSC 2 Increment (Base pitch +/- Octave Shift)
+    double osc2Freq = baseFreq * pow(2, synthParams.osc2OctaveOffset);
+    voice.osc2Inc = osc2Freq / I2S_SAMPLE_RATE;
+    voice.osc2Phase = 0.0;
+}
+
+
+void updateVoices() {
+    for (int i = 0; i < TOTAL_KEYS; i++) {
+        bool keyIsPressed = keyState[i];
+        
+        if (keyIsPressed) {
+            bool voiceFound = false;
+            // Check if this key already owns a voice
+            for (int v = 0; v < MAX_POLYPHONY_VOICES; v++) {
+                if (voices[v].active && voices[v].keyIndex == i) {
+                    voiceFound = true;
+                    break;
+                }
+            }
+            
+            // If key is newly pressed (voice not found), find a free voice
+            if (!voiceFound) {
+                for (int v = 0; v < MAX_POLYPHONY_VOICES; v++) {
+                    if (!voices[v].active) {
+                        voices[v].active = true;
+                        voices[v].keyIndex = i;
+                        
+                        // Setup the dual oscillator frequencies
+                        setupVoicePitches(voices[v], i);
+                        
+                        break; 
+                    }
+                }
+            }
+        } 
+        else {
+            for (int v = 0; v < MAX_POLYPHONY_VOICES; v++) {
+                if (voices[v].active && voices[v].keyIndex == i) {
+                    voices[v].active = false;
+                    voices[v].keyIndex = -1;
+                    voices[v].baseFreq = 0.0;
+                    break;
+                }
+            }
+        }
+    }
+}
+
+// --- WEB SERVER FUNCTIONS ---
+
+void handleRoot() {
+  server.send(200, "text/html", INDEX_HTML);
+}
+
+// JSON parsing library is not standard, so we use string manipulation or ArduinoJson. 
+// For simplicity and dependency avoidance, we parse the settings manually from the JSON string.
+bool parseSettingsJson(String json) {
+    // Extract masterVolume
+    int start = json.indexOf("\"masterVolume\":");
+    if (start != -1) {
+        start += 15;
+        int end = json.indexOf(",", start);
+        String val = json.substring(start, end);
+        masterVolume = val.toFloat();
+        masterVolume = constrain(masterVolume, 0.0, 1.0);
+    } else return false;
+
+    // Extract osc1Waveform
+    start = json.indexOf("\"osc1Waveform\":") + 15;
+    synthParams.osc1Waveform = (Waveform)json.substring(start, json.indexOf(",", start)).toInt();
+    
+    // Extract osc1Volume
+    start = json.indexOf("\"osc1Volume\":") + 13;
+    synthParams.osc1Volume = constrain(json.substring(start, json.indexOf(",", start)).toFloat(), 0.0, 1.0);
+    
+    // Extract osc2Waveform
+    start = json.indexOf("\"osc2Waveform\":") + 15;
+    synthParams.osc2Waveform = (Waveform)json.substring(start, json.indexOf(",", start)).toInt();
+    
+    // Extract osc2Volume
+    start = json.indexOf("\"osc2Volume\":") + 13;
+    synthParams.osc2Volume = constrain(json.substring(start, json.indexOf(",", start)).toFloat(), 0.0, 1.0);
+
+    // Extract osc2OctaveOffset
+    start = json.indexOf("\"osc2OctaveOffset\":") + 19;
+    synthParams.osc2OctaveOffset = json.substring(start, json.indexOf(",", start)).toInt();
+    
+    // Extract modulationType
+    start = json.indexOf("\"modulationType\":") + 17;
+    synthParams.modulationType = (ModType)json.substring(start, json.indexOf(",", start)).toInt();
+
+    // Extract modDepth (last element, ends with '}')
+    start = json.indexOf("\"modDepth\":") + 11;
+    synthParams.modDepth = constrain(json.substring(start, json.indexOf("}", start)).toFloat(), 0.0, 1.0);
+
+    return true;
+}
+
+
+void handleSetSettings() {
+    // Expecting JSON body via POST request
+    if (server.hasArg("plain") == false) {
+        server.send(400, "text/plain", "Missing JSON body");
+        return;
+    }
+
+    String json = server.arg("plain");
+    
+    if (parseSettingsJson(json)) {
+        // Since parameters affect voice pitch, all active voices must be re-initialized
+        // when OSC2 octave changes, or when modulation type changes (FM is special).
+        
+        // This is a crude way to update all active voices immediately when settings change.
+        for (int v = 0; v < MAX_POLYPHONY_VOICES; v++) {
+            if (voices[v].active) {
+                setupVoicePitches(voices[v], voices[v].keyIndex);
+            }
+        }
+        
+        server.send(200, "text/plain", "Settings updated.");
+    } else {
+        server.send(400, "text/plain", "Invalid JSON format.");
+    }
+}
+
+String getActiveNoteStatusJson() {
+    String json = "[";
+    bool first = true;
+    for (int v = 0; v < MAX_POLYPHONY_VOICES; v++) {
+        if (voices[v].active) {
+            if (!first) {
+                json += ",";
+            }
+            int row = voices[v].keyIndex / NUM_COLS;
+            int col = voices[v].keyIndex % NUM_COLS;
+            
+            json += "{\"note\":\"";
+            json += keyNames[row][col];
+            json += "\",\"freq\":";
+            json += String(voices[v].baseFreq, 2);
+            json += "}";
+            first = false;
+        }
+    }
+    json += "]";
+    return json;
+}
+
+void handleStatus() {
+    server.send(200, "application/json", getActiveNoteStatusJson());
+}
+
+
+// --- MAIN FUNCTIONS ---
+
+void setup() {
+  Serial.begin(115200);
+  
+  // 1. Setup Matrix Pins
+  for (int i = 0; i < NUM_ROWS; i++) {
+    pinMode(rowPins[i], OUTPUT);
+    digitalWrite(rowPins[i], HIGH); 
+  }
+  for (int i = 0; i < NUM_COLS; i++) {
+    pinMode(colPins[i], INPUT_PULLUP); 
+  }
+  
+  // 2. Initialize Musical Scale and Waveform Tables
+  mapScaleToKeypad();
+  initSineTable();
+
+  // 3. Initialize I2S Audio
+  initI2S();
+
+  // 4. WiFi AP and Server Setup
+  WiFi.softAP(ssid, password);
+  Serial.print("Hotspot started: ");
+  Serial.println(ssid);
+  Serial.print("Connect phone/PC to this network. IP: ");
+  Serial.println(WiFi.softAPIP());
+
+  // 5. Web Server Routes
+  server.on("/", handleRoot);
+  server.on("/setSettings", HTTP_POST, handleSetSettings); // Now accepts POST with JSON
+  server.on("/status", handleStatus);
+  server.begin();
+
+  // 6. Create the audio task and pin it to Core 1
+  xTaskCreatePinnedToCore(
+    audioTask,      
+    "AudioTask",    
+    10000,          
+    NULL,           
+    1,              
+    NULL,           
+    1               
+  );
+}
+
+void loop() {
+  server.handleClient(); // Web Server handling on Core 0
+  
+  // High-speed key matrix scan and voice update on Core 0
+  scanKeypad(); 
+  updateVoices();
+  
+  delay(10); 
+}
