@@ -105,3 +105,4 @@ Implementation:
 ![Project Screenshot](assets/5.jpg)
 ![Project Screenshot](assets/6.jpg)
 ![Project Screenshot](assets/7.jpg)
+<img src="assets/1.jpg" width="600" alt="Project Screenshot">
